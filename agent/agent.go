@@ -115,6 +115,19 @@ func NewAgent(dataDir ...string) (agent *Agent, err error) {
 		}
 	}
 
+	// Arm the Android seccomp shield before anything can exec: the initial
+	// battery fetch below spawns termux-battery-status, and on Android < 12
+	// the runtime's one-time pidfd_open probe in os/exec would otherwise kill
+	// the whole process with SIGSYS (see android_seccomp.go).
+	armAndroidSeccompShield()
+
+	// CPU source diagnostics: on unrooted Android the failure mode is a
+	// silent 0% CPU, so make the chosen source and the reasons visible once
+	// at startup, and verify ~4s later that the engaged source produces
+	// numbers.
+	logCpuSourceDiagnostics()
+	go cpuSelfCheck()
+
 	slog.Debug(beszel.Version)
 
 	agent.warnIfRootCgroup()

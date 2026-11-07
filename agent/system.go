@@ -178,6 +178,9 @@ func (a *Agent) getSystemStats(cacheTimeMs uint16) system.Stats {
 	} else {
 		slog.Error("Error getting cpu metrics", "err", err)
 	}
+	// Surface a persistently dead CPU source: several consecutive zero
+	// polls at the default interval are worth a warning.
+	noteCpuPollOutcome(cacheTimeMs, err, systemStats.Cpu)
 
 	// per-core cpu usage. Skipped when the total comes from cgroup accounting:
 	// per-core /proc/stat counters there describe shared host cores, not the

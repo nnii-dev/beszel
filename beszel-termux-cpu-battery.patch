@@ -1,0 +1,2706 @@
+diff --git a/agent/agent.go b/agent/agent.go
+index 7c0104d..e2cb4f2 100644
+--- a/agent/agent.go
++++ b/agent/agent.go
+@@ -115,6 +115,19 @@ func NewAgent(dataDir ...string) (agent *Agent, err error) {
+ 		}
+ 	}
+ 
++	// Arm the Android seccomp shield before anything can exec: the initial
++	// battery fetch below spawns termux-battery-status, and on Android < 12
++	// the runtime's one-time pidfd_open probe in os/exec would otherwise kill
++	// the whole process with SIGSYS (see android_seccomp.go).
++	armAndroidSeccompShield()
++
++	// CPU source diagnostics: on unrooted Android the failure mode is a
++	// silent 0% CPU, so make the chosen source and the reasons visible once
++	// at startup, and verify ~4s later that the engaged source produces
++	// numbers.
++	logCpuSourceDiagnostics()
++	go cpuSelfCheck()
++
+ 	slog.Debug(beszel.Version)
+ 
+ 	agent.warnIfRootCgroup()
+diff --git a/agent/android_seccomp.go b/agent/android_seccomp.go
+new file mode 100644
+index 0000000..c73493f
+--- /dev/null
++++ b/agent/android_seccomp.go
+@@ -0,0 +1,90 @@
++//go:build linux
++
++package agent
++
++// Seccomp SIGSYS shield for unrooted Android.
++//
++// Modern Go runtimes probe newer syscalls the first time they are needed:
++//
++//   - os/exec (and os.StartProcess / os.ForkExec) probe pidfd_open (kernel
++//     5.3+) once per process, before the first child is started;
++//   - exec.LookPath probes faccessat2 (kernel 5.8+).
++//
++// On Android < 12 the app seccomp filter kills the process with SIGSYS for
++// every syscall it does not whitelist (Go issue #69065). The Go runtime ships
++// a built-in mitigation for exactly this: setting the runtime's sigsysIgnored
++// flag makes sighandler silently swallow seccomp-generated SIGSYS and turn
++// the blocked syscall into an ordinary error return, which callers fall back
++// from gracefully. The runtime only enables it for GOOS=android builds
++// (src/os/pidfd_linux.go, checkPidfd: "In Android version < 12, pidfd-related
++// system calls are not allowed by seccomp and trigger the SIGSYS signal").
++//
++// This agent must be built with GOOS=linux: both the Android CPU fallback and
++// the Termux battery fallback are gated on runtime.GOOS == "linux", so the
++// runtime's own mitigation never engages. Without this shield the first exec
++// in the process — the synchronous initial termux-battery-status fetch inside
++// NewAgent — died as:
++//
++//	SIGSYS: bad system call
++//	internal/syscall/unix.PidFDOpen(...)
++//	os.checkPidfd() / os.ensurePidfd(...)
++//
++// The linkname below pulls the runtime's ignoreSIGSYS implementation (pushed
++// to os.ignoreSIGSYS in src/runtime/signal_unix.go) so the agent can arm the
++// same protection itself. Pulling is permitted by the linker because the
++// runtime defines the symbol with a push //go:linkname. Once armed,
++// seccomp-trapped syscalls fail with ENOSYS/EPERM instead of killing the
++// process, which also protects every other exec site in the agent (network
++// monitor pings, smartctl, package updates, ...) on old Android devices.
++
++import (
++	"log/slog"
++	"os"
++	"runtime"
++	"sync"
++	_ "unsafe" // for //go:linkname
++)
++
++//go:linkname ignoreSIGSYS os.ignoreSIGSYS
++func ignoreSIGSYS()
++
++var (
++	seccompShieldOnce  sync.Once
++	seccompShieldArmed bool
++)
++
++// armAndroidSeccompShield permanently ignores seccomp-generated SIGSYS
++// signals when the agent runs on unrooted Android. It is a no-op on regular
++// Linux hosts (TERMUX_VERSION unset and /system/build.prop absent), so server
++// behavior is unchanged.
++//
++// It MUST run before the first os/exec / os.StartProcess in the process:
++// NewAgent fetches the initial battery reading synchronously, and that exec
++// is what used to trip the runtime's one-time pidfd_open probe.
++func armAndroidSeccompShield() {
++	if runtime.GOOS != "linux" {
++		return
++	}
++	seccompShieldOnce.Do(func() {
++		if !androidRuntimeDetected() {
++			return
++		}
++		ignoreSIGSYS()
++		seccompShieldArmed = true
++		slog.Info("android seccomp shield armed: seccomp SIGSYS traps are ignored process-wide",
++			"note", "syscalls not whitelisted by old Android (pidfd_open, faccessat2, ...) now fail with an error instead of killing the agent")
++	})
++}
++
++// androidRuntimeDetected reports whether this process runs on Android,
++// inside Termux (TERMUX_VERSION is exported by the Termux shell) or under
++// any other Android shell (/system/build.prop is world-readable).
++func androidRuntimeDetected() bool {
++	if os.Getenv("TERMUX_VERSION") != "" {
++		return true
++	}
++	if _, err := os.Stat("/system/build.prop"); err == nil {
++		return true
++	}
++	return false
++}
+diff --git a/agent/android_seccomp_test.go b/agent/android_seccomp_test.go
+new file mode 100644
+index 0000000..77d72c8
+--- /dev/null
++++ b/agent/android_seccomp_test.go
+@@ -0,0 +1,34 @@
++//go:build linux
++
++package agent
++
++import (
++	"os"
++	"testing"
++)
++
++// TestAndroidSeccompShieldDetection verifies the Android detection gate:
++// TERMUX_VERSION is the primary marker exported by the Termux shell.
++func TestAndroidSeccompShieldDetection(t *testing.T) {
++	t.Setenv("TERMUX_VERSION", "0.118.0")
++	if !androidRuntimeDetected() {
++		t.Fatal("expected Android detection via TERMUX_VERSION")
++	}
++}
++
++// TestAndroidSeccompShieldNoop verifies that on a regular Linux host (no
++// TERMUX_VERSION, no /system/build.prop) the shield stays unarmed and
++// arming is a harmless no-op.
++func TestAndroidSeccompShieldNoop(t *testing.T) {
++	t.Setenv("TERMUX_VERSION", "")
++	if _, err := os.Stat("/system/build.prop"); err == nil {
++		t.Skip("/system/build.prop readable: this looks like a real Android host")
++	}
++	if androidRuntimeDetected() {
++		t.Fatal("expected no Android detection on a regular Linux host")
++	}
++	armAndroidSeccompShield()
++	if seccompShieldArmed {
++		t.Fatal("shield must stay unarmed off Android")
++	}
++}
+diff --git a/agent/battery/battery_linux.go b/agent/battery/battery_linux.go
+index 2935d5a..3e20549 100644
+--- a/agent/battery/battery_linux.go
++++ b/agent/battery/battery_linux.go
+@@ -1,85 +1,107 @@
+-//go:build linux
++//go:build linux || android
+ 
+ package battery
+ 
+ import (
+-	"os"
+-	"path/filepath"
+-	"strconv"
++        "log/slog"
++        "os"
++        "path/filepath"
++        "strconv"
+ 
+-	"github.com/henrygd/beszel/agent/utils"
++        "github.com/henrygd/beszel/agent/utils"
+ )
+ 
+ var batteryRoot = "/sys/class/power_supply"
+ 
+ // HasReadableBattery reports whether collection currently finds a readable battery.
+ func HasReadableBattery() bool {
+-	batteries, _ := GetBatteryStats()
+-	return len(batteries) > 0
++        batteries, _ := GetBatteryStats()
++        return len(batteries) > 0
+ }
+ 
+ func parseSysfsState(status string) uint8 {
+-	switch status {
+-	case "Empty":
+-		return stateEmpty
+-	case "Full":
+-		return stateFull
+-	case "Charging":
+-		return stateCharging
+-	case "Discharging":
+-		return stateDischarging
+-	case "Not charging":
+-		return stateIdle
+-	default:
+-		return stateUnknown
+-	}
++        switch status {
++        case "Empty":
++                return stateEmpty
++        case "Full":
++                return stateFull
++        case "Charging":
++                return stateCharging
++        case "Discharging":
++                return stateDischarging
++        case "Not charging":
++                return stateIdle
++        default:
++                return stateUnknown
++        }
+ }
+ 
+-// GetBatteryStats re-enumerates power supplies and returns every readable battery.
++// getSysfsBatteryStats enumerates /sys/class/power_supply and returns every
++// readable battery. On unrooted Android the whole directory is SELinux-denied
++// to the agent's UID, so this fails and the Termux fallback in
++// battery_termux.go is used instead.
++func getSysfsBatteryStats() ([]Battery, error) {
++        entries, err := os.ReadDir(batteryRoot)
++        if err != nil {
++                return nil, err
++        }
++        batteries := make([]Battery, 0, len(entries))
++        for _, entry := range entries {
++                path := filepath.Join(batteryRoot, entry.Name())
++                if utils.ReadStringFile(filepath.Join(path, "type")) != "Battery" {
++                        continue
++                }
++                capStr, ok := utils.ReadStringFileOK(filepath.Join(path, "capacity"))
++                if !ok {
++                        continue
++                }
++                cap, parseErr := strconv.Atoi(capStr)
++                if parseErr != nil {
++                        continue
++                }
++                cap = min(max(cap, 0), 100)
++                name := utils.ReadStringFile(filepath.Join(path, "model_name"))
++                if name == "" {
++                        name = utils.ReadStringFile(filepath.Join(path, "model"))
++                }
++                if name == "" {
++                        name = entry.Name()
++                }
++                battery := Battery{
++                        Name:    name,
++                        Percent: uint8(cap),
++                        State:   parseSysfsState(utils.ReadStringFile(filepath.Join(path, "status"))),
++                        System:  utils.ReadStringFile(filepath.Join(path, "scope")) != "Device",
++                }
++                for _, fullName := range []string{"charge_full", "energy_full"} {
++                        if parsed, ok := utils.ReadUintFile(filepath.Join(path, fullName)); ok && parsed > 0 {
++                                battery.FullChargeCapacity = parsed
++                                battery.HasFullChargeCapacity = true
++                                break
++                        }
++                }
++                batteries = append(batteries, battery)
++        }
++        if len(batteries) == 0 {
++                return nil, errNoBatteries
++        }
++        return normalizeBatteries(batteries), nil
++}
++
++// GetBatteryStats returns every readable battery, preferring the standard
++// sysfs power-supply class and falling back to the Termux battery API
++// (termux-battery-status) on unrooted Android, where sysfs is inaccessible.
+ func GetBatteryStats() ([]Battery, error) {
+-	entries, err := os.ReadDir(batteryRoot)
+-	if err != nil {
+-		return nil, err
+-	}
+-	batteries := make([]Battery, 0, len(entries))
+-	for _, entry := range entries {
+-		path := filepath.Join(batteryRoot, entry.Name())
+-		if utils.ReadStringFile(filepath.Join(path, "type")) != "Battery" {
+-			continue
+-		}
+-		capStr, ok := utils.ReadStringFileOK(filepath.Join(path, "capacity"))
+-		if !ok {
+-			continue
+-		}
+-		cap, parseErr := strconv.Atoi(capStr)
+-		if parseErr != nil {
+-			continue
+-		}
+-		cap = min(max(cap, 0), 100)
+-		name := utils.ReadStringFile(filepath.Join(path, "model_name"))
+-		if name == "" {
+-			name = utils.ReadStringFile(filepath.Join(path, "model"))
+-		}
+-		if name == "" {
+-			name = entry.Name()
+-		}
+-		battery := Battery{
+-			Name:    name,
+-			Percent: uint8(cap),
+-			State:   parseSysfsState(utils.ReadStringFile(filepath.Join(path, "status"))),
+-			System:  utils.ReadStringFile(filepath.Join(path, "scope")) != "Device",
+-		}
+-		for _, fullName := range []string{"charge_full", "energy_full"} {
+-			if parsed, ok := utils.ReadUintFile(filepath.Join(path, fullName)); ok && parsed > 0 {
+-				battery.FullChargeCapacity = parsed
+-				battery.HasFullChargeCapacity = true
+-				break
+-			}
+-		}
+-		batteries = append(batteries, battery)
+-	}
+-	if len(batteries) == 0 {
+-		return nil, errNoBatteries
+-	}
+-	return normalizeBatteries(batteries), nil
++        batteries, sysfsErr := getSysfsBatteryStats()
++        if sysfsErr == nil && len(batteries) > 0 {
++                return batteries, nil
++        }
++        if termuxBatteries, termuxErr := getTermuxBatteryStats(); termuxErr == nil {
++                return termuxBatteries, nil
++        }
++        if sysfsErr != nil {
++                slog.Debug("battery: sysfs power supplies unavailable", "err", sysfsErr)
++                return nil, sysfsErr
++        }
++        return nil, errNoBatteries
+ }
+diff --git a/agent/battery/battery_stub.go b/agent/battery/battery_stub.go
+index b7302ab..037a71e 100644
+--- a/agent/battery/battery_stub.go
++++ b/agent/battery/battery_stub.go
+@@ -1,4 +1,4 @@
+-//go:build !darwin && !linux && !windows
++//go:build !darwin && !linux && !android && !windows
+ 
+ package battery
+ 
+diff --git a/agent/battery/battery_termux.go b/agent/battery/battery_termux.go
+new file mode 100644
+index 0000000..4813379
+--- /dev/null
++++ b/agent/battery/battery_termux.go
+@@ -0,0 +1,371 @@
++//go:build linux || android
++
++package battery
++
++// Termux battery fallback for unrooted Android.
++//
++// On an unrooted Android device, /sys/class/power_supply is SELinux-denied
++// to the agent's UID, so getSysfsBatteryStats can never find a battery. The
++// Termux:API app can read the battery through Android's BatteryManager
++// without root; the `termux-battery-status` helper (termux-api package)
++// prints it as JSON, e.g.:
++//
++//      {"percentage":85.0,"status":"NOT_CHARGING","plugged":"UNPLUGGED",...}
++//
++// Design: the first call after startup fetches synchronously (so the very
++// first poll the hub sees already carries battery data) and starts a
++// background refresher that updates a cached snapshot every 2 minutes. All
++// later polls return the snapshot — no helper process is ever spawned while
++// the agent's collection lock is held after startup.
++//
++// Spawn mechanism: the helper is started with runTermuxCommand, a raw
++// syscall.StartProcess runner. os/exec is deliberately avoided: its
++// Cmd.Start probes the pidfd_open syscall once per process, and on
++// Android < 12 that probe is killed by seccomp with SIGSYS, terminating the
++// whole agent (Go issue #69065 — the runtime only auto-mitigates for
++// GOOS=android builds, while this agent is built with GOOS=linux).
++
++import (
++        "context"
++        "encoding/json"
++        "errors"
++        "fmt"
++        "io"
++        "log/slog"
++        "math"
++        "os"
++        "path/filepath"
++        "strings"
++        "sync"
++        "syscall"
++        "time"
++
++        "github.com/henrygd/beszel/agent/utils"
++)
++
++const (
++        // termuxBatteryBin is the Termux:API helper that reports battery state
++        // as JSON without root.
++        termuxBatteryBin = "termux-battery-status"
++        // termuxBatteryTimeout bounds a single termux-battery-status invocation;
++        // it starts a Java process and a binder roundtrip, so it can take a while.
++        termuxBatteryTimeout = 12 * time.Second
++        // termuxBatteryRefreshInterval is how often the background refresher
++        // updates the cached reading. Battery percentage moves slowly and each
++        // refresh spawns a Java process, so this is deliberately slow.
++        termuxBatteryRefreshInterval = 2 * time.Minute
++        // termuxBatteryMaxFailures is the consecutive-failure circuit breaker
++        // threshold after which collection is disabled until restart.
++        termuxBatteryMaxFailures = 3
++)
++
++// Hooks so tests can inject a fake lookup / fetch.
++var (
++        termuxBatteryLookPath = utils.SafeLookPath
++        termuxBatteryRefresh  = termuxBatteryRefreshInterval
++        termuxBatteryFetch    = fetchTermuxBattery
++        // termuxBatteryRunner is the process-spawn function used by
++        // fetchTermuxBattery; overridable so tests can exercise the real runner
++        // without touching a real helper install.
++        termuxBatteryRunner = runTermuxCommand
++)
++
++// termuxBatteryCache caches the latest reading so getSystemStats never execs
++// a helper process under the agent lock after the initial fetch.
++type termuxBatteryCache struct {
++        mu        sync.Mutex
++        batteries []Battery
++        at        time.Time
++        started   bool // refresher goroutine launched
++        failures  int  // consecutive failures (circuit breaker)
++        disabled  bool // give up until process restart
++}
++
++var termuxCache termuxBatteryCache
++
++// resetTermuxBatteryCache resets all package-level state (tests only).
++func resetTermuxBatteryCache() {
++        termuxCache.mu.Lock()
++        defer termuxCache.mu.Unlock()
++        termuxCache.batteries = nil
++        termuxCache.at = time.Time{}
++        termuxCache.started = false
++        termuxCache.failures = 0
++        termuxCache.disabled = false
++}
++
++// getTermuxBatteryStats returns the Termux battery reading. The first call
++// fetches synchronously (logged), and every later call returns the cached
++// snapshot that the background refresher keeps current.
++func getTermuxBatteryStats() ([]Battery, error) {
++        if os.Getenv("TERMUX_VERSION") == "" {
++                return nil, errNoBatteries // not running under Termux
++        }
++        termuxCache.mu.Lock()
++        defer termuxCache.mu.Unlock()
++        if termuxCache.disabled {
++                return nil, errNoBatteries
++        }
++        if len(termuxCache.batteries) > 0 {
++                slog.Debug("termux battery: cached reading",
++                        "percent", termuxCache.batteries[0].Percent,
++                        "status", termuxCache.batteries[0].State,
++                        "age", time.Since(termuxCache.at).Round(time.Second).String())
++                return termuxCache.batteries, nil
++        }
++        // No cached reading yet: fetch one synchronously so the very first poll
++        // after the hub connects already carries battery data.
++        slog.Info("termux battery: fetching initial reading synchronously")
++        path, lookErr := termuxBatteryLookPath(termuxBatteryBin)
++        if lookErr != nil {
++                // The helper binary is missing; this will not fix itself.
++                slog.Warn("termux battery: termux-battery-status not found in PATH", "err", lookErr,
++                        "hint", "install the Termux:API app and the termux-api package")
++                termuxCache.disabled = true
++                return nil, errNoBatteries
++        }
++        batteries, err := termuxBatteryFetch(path)
++        if err != nil {
++                termuxCache.recordFailureLocked()
++                slog.Debug("termux battery: initial fetch failed", "err", err)
++                return nil, err
++        }
++        termuxCache.batteries = batteries
++        termuxCache.at = time.Now()
++        termuxCache.failures = 0
++        slog.Info("termux battery: fallback active",
++                "percent", batteries[0].Percent,
++                "status", batteries[0].State,
++                "refresh_interval", termuxBatteryRefresh.String())
++        termuxCache.startRefresherLocked(path)
++        return batteries, nil
++}
++
++// recordFailureLocked counts a failed fetch and disables collection once
++// termuxBatteryMaxFailures consecutive attempts have failed (circuit
++// breaker: never exec a failing helper on every poll).
++// Caller must hold c.mu.
++func (c *termuxBatteryCache) recordFailureLocked() {
++        c.failures++
++        if c.failures >= termuxBatteryMaxFailures {
++                c.disabled = true
++                slog.Warn("termux battery: disabled after repeated failures",
++                        "consecutive_failures", c.failures,
++                        "hint", "check that the Termux:API app is installed; restart the agent to retry")
++        }
++}
++
++// startRefresherLocked launches the background refresher goroutine (once).
++// Caller must hold c.mu.
++func (c *termuxBatteryCache) startRefresherLocked(path string) {
++        if c.started {
++                return
++        }
++        c.started = true
++        go func() {
++                ticker := time.NewTicker(termuxBatteryRefresh)
++                defer ticker.Stop()
++                for range ticker.C {
++                        c.refreshOnce(path)
++                        c.mu.Lock()
++                        disabled := c.disabled
++                        c.mu.Unlock()
++                        if disabled {
++                                return // circuit breaker tripped: stop refreshing
++                        }
++                }
++        }()
++}
++
++// refreshOnce fetches a fresh reading and updates the cache or the failure
++// counter. Called from the refresher goroutine only.
++func (c *termuxBatteryCache) refreshOnce(path string) {
++        batteries, err := termuxBatteryFetch(path)
++        c.mu.Lock()
++        defer c.mu.Unlock()
++        if err != nil {
++                c.recordFailureLocked()
++                slog.Debug("termux battery: refresh failed", "err", err)
++                return
++        }
++        c.failures = 0
++        c.batteries = batteries
++        c.at = time.Now()
++        slog.Debug("termux battery: refreshed", "percent", batteries[0].Percent, "status", batteries[0].State)
++}
++
++// fetchTermuxBattery runs termux-battery-status once and parses its JSON
++// output. The resolved path contains a separator and the command is spawned
++// with runTermuxCommand (raw syscall.StartProcess), never os/exec — see
++// runTermuxCommand for why (pidfd_open probe + seccomp SIGSYS on Android <12).
++func fetchTermuxBattery(path string) ([]Battery, error) {
++        ctx, cancel := context.WithTimeout(context.Background(), termuxBatteryTimeout)
++        defer cancel()
++        out, err := termuxBatteryRunner(ctx, path)
++        if err != nil {
++                return nil, err
++        }
++        battery, err := parseTermuxBattery(out)
++        if err != nil {
++                return nil, err
++        }
++        return normalizeBatteries([]Battery{battery}), nil
++}
++
++// runTermuxCommand spawns path with the given arguments and returns the
++// child's stdout, bypassing os/exec entirely.
++//
++// Why not os/exec: exec.Cmd.Start goes through os.startProcess, which calls
++// ensurePidfd → checkPidfd. That check probes pidfd_open (kernel 5.3+) once
++// per process; on Android < 12 the seccomp filter kills the process with
++// SIGSYS for it (Go issue #69065, mitigated upstream only for GOOS=android
++// builds — this agent is GOOS=linux). syscall.StartProcess is the plain
++// fork/exec path — clone(SIGCHLD) + execve — which every Android seccomp
++// filter whitelists, and is exactly what os/exec itself uses once its probe
++// fails. (The agent additionally arms the runtime SIGSYS shield; see
++// agent/android_seccomp.go. This runner removes os/exec from the critical
++// battery path so battery collection works even without it.)
++//
++// stderr is captured and included in the returned error on nonzero exit.
++// ctx caps the runtime: on expiry the child is killed with SIGKILL and
++// reaped, so no zombie or goroutine is left behind.
++func runTermuxCommand(ctx context.Context, path string, args ...string) ([]byte, error) {
++        devnull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
++        if err != nil {
++                return nil, fmt.Errorf("%s: open %s: %w", filepath.Base(path), os.DevNull, err)
++        }
++        defer devnull.Close()
++
++        stdoutR, stdoutW, err := os.Pipe()
++        if err != nil {
++                return nil, fmt.Errorf("%s: pipe: %w", filepath.Base(path), err)
++        }
++        stderrR, stderrW, err := os.Pipe()
++        if err != nil {
++                stdoutR.Close()
++                stdoutW.Close()
++                return nil, fmt.Errorf("%s: pipe: %w", filepath.Base(path), err)
++        }
++
++        attr := &syscall.ProcAttr{
++                Env:   os.Environ(),
++                Files: []uintptr{devnull.Fd(), stdoutW.Fd(), stderrW.Fd()},
++        }
++        pid, _, startErr := syscall.StartProcess(path, append([]string{path}, args...), attr)
++        // Close the child-side pipe ends in the parent either way so readers see
++        // EOF once the child exits.
++        stdoutW.Close()
++        stderrW.Close()
++        if startErr != nil {
++                stdoutR.Close()
++                stderrR.Close()
++                return nil, fmt.Errorf("%s: start: %w", filepath.Base(path), startErr)
++        }
++
++        // Drain both pipes; the channels are buffered so the reader goroutines
++        // never block on send, even when this function returns early on timeout.
++        stdoutCh := make(chan []byte, 1)
++        stderrCh := make(chan []byte, 1)
++        go func() {
++                b, _ := io.ReadAll(stdoutR)
++                stdoutR.Close()
++                stdoutCh <- b
++        }()
++        go func() {
++                b, _ := io.ReadAll(stderrR)
++                stderrR.Close()
++                stderrCh <- b
++        }()
++
++        type waitResult struct {
++                ws  syscall.WaitStatus
++                err error
++        }
++        waitCh := make(chan waitResult, 1)
++        go func() {
++                var ws syscall.WaitStatus
++                for {
++                        _, waitErr := syscall.Wait4(pid, &ws, 0, nil)
++                        if waitErr == syscall.EINTR {
++                                continue
++                        }
++                        waitCh <- waitResult{ws, waitErr}
++                        return
++                }
++        }()
++
++        var res waitResult
++        select {
++        case <-ctx.Done():
++                syscall.Kill(pid, syscall.SIGKILL)
++                res = <-waitCh // reap the killed child
++                return nil, fmt.Errorf("%s: timed out after %s", filepath.Base(path), termuxBatteryTimeout)
++        case res = <-waitCh:
++        }
++
++        stdout := <-stdoutCh
++        stderrBytes := <-stderrCh
++        if res.err != nil {
++                return nil, fmt.Errorf("%s: wait: %w", filepath.Base(path), res.err)
++        }
++        if res.ws.Signaled() {
++                return nil, fmt.Errorf("%s: killed by signal %d", filepath.Base(path), res.ws.Signal())
++        }
++        if !res.ws.Exited() {
++                return nil, fmt.Errorf("%s: did not exit normally (status %#x)", filepath.Base(path), res.ws)
++        }
++        if code := res.ws.ExitStatus(); code != 0 {
++                msg := strings.TrimSpace(string(stderrBytes))
++                if msg == "" {
++                        msg = strings.TrimSpace(string(stdout))
++                }
++                if len(msg) > 200 {
++                        msg = msg[:200] + "…"
++                }
++                return nil, fmt.Errorf("%s: exit status %d: %s", filepath.Base(path), code, msg)
++        }
++        return stdout, nil
++}
++
++// parseTermuxBattery parses termux-battery-status JSON, e.g.
++// {"percentage":82.5,"status":"DISCHARGING","plugged":"UNPLUGGED",...}.
++func parseTermuxBattery(data []byte) (Battery, error) {
++        var payload struct {
++                Percentage *float64 `json:"percentage"`
++                Status     string   `json:"status"`
++                Plugged    string   `json:"plugged"`
++        }
++        if err := json.Unmarshal(data, &payload); err != nil {
++                return Battery{}, fmt.Errorf("parsing termux-battery-status output: %w", err)
++        }
++        if payload.Percentage == nil {
++                return Battery{}, errors.New("termux-battery-status: response has no percentage")
++        }
++        percent := uint8(min(max(math.Round(*payload.Percentage), 0), 100))
++        return Battery{
++                Name:    "Battery",
++                Percent: percent,
++                State:   parseTermuxState(payload.Status),
++                System:  true,
++        }, nil
++}
++
++// parseTermuxState maps Android BatteryManager status strings to beszel
++// battery states (unknown=0, empty=1, full=2, charging=3, discharging=4,
++// idle=5).
++func parseTermuxState(status string) uint8 {
++        switch status {
++        case "CHARGING":
++                return stateCharging
++        case "DISCHARGING":
++                return stateDischarging
++        case "FULL":
++                return stateFull
++        case "NOT_CHARGING":
++                return stateIdle
++        case "EMPTY":
++                return stateEmpty
++        default:
++                return stateUnknown
++        }
++}
+diff --git a/agent/battery/battery_termux_test.go b/agent/battery/battery_termux_test.go
+new file mode 100644
+index 0000000..4146b09
+--- /dev/null
++++ b/agent/battery/battery_termux_test.go
+@@ -0,0 +1,290 @@
++//go:build linux
++
++package battery
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++// writeTermuxScript creates a fake termux-battery-status executable in a
++// temporary PATH directory and returns the directory.
++func writeTermuxScript(t *testing.T, dir string, content string) string {
++	t.Helper()
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	script := filepath.Join(dir, "termux-battery-status")
++	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	return dir
++}
++
++const validTermuxJSON = `{"percentage":82.6,"status":"CHARGING","plugged":"PLUGGED_AC","temperature":31.0}
++`
++
++// TestTermuxFallbackActive verifies the full fallback flow: sysfs denied +
++// TERMUX_VERSION set + fake termux-battery-status on PATH → first call
++// fetches synchronously and starts the refresher; later calls use the
++// cached snapshot without re-exec.
++func TestTermuxFallbackActive(t *testing.T) {
++	tmp := t.TempDir()
++	batteryRoot = filepath.Join(tmp, "missing_power_supply")
++	t.Cleanup(func() { batteryRoot = "/sys/class/power_supply" })
++	t.Setenv("TERMUX_VERSION", "0.118.0")
++	resetTermuxBatteryCache()
++	t.Cleanup(resetTermuxBatteryCache)
++
++	pathDir := writeTermuxScript(t, filepath.Join(tmp, "bin"), "#!/bin/sh\nprintf '%s' '"+validTermuxJSON+"'\n")
++	t.Setenv("PATH", pathDir)
++
++	batteries, err := GetBatteryStats()
++	if err != nil {
++		t.Fatalf("expected termux fallback to provide a battery, got %v", err)
++	}
++	if len(batteries) != 1 {
++		t.Fatalf("expected 1 battery, got %d", len(batteries))
++	}
++	b := batteries[0]
++	if b.Name != "Battery" {
++		t.Fatalf("expected name Battery, got %q", b.Name)
++	}
++	if b.Percent != 83 {
++		t.Fatalf("expected percent 83 (82.6 rounded), got %d", b.Percent)
++	}
++	if b.State != stateCharging {
++		t.Fatalf("expected charging state, got %d", b.State)
++	}
++	if !b.System {
++		t.Fatal("expected system battery")
++	}
++	if !HasReadableBattery() {
++		t.Fatal("expected HasReadableBattery to be true")
++	}
++
++	// Second call must use the cached snapshot: rewrite the script to fail
++	// and confirm the cache still serves a reading.
++	writeTermuxScript(t, pathDir, "#!/bin/sh\nexit 1\n")
++	cached, err := GetBatteryStats()
++	if err != nil {
++		t.Fatalf("expected cached snapshot after helper failure, got %v", err)
++	}
++	if len(cached) != 1 || cached[0].Percent != 83 {
++		t.Fatalf("expected cached 83%%, got %+v", cached)
++	}
++}
++
++// TestTermuxRefresherUpdatesAndBreaks exercises refreshOnce directly:
++// success updates the snapshot and resets failures; three consecutive
++// failures trip the circuit breaker and stop the refresher.
++func TestTermuxRefresherUpdatesAndBreaks(t *testing.T) {
++	tmp := t.TempDir()
++	t.Setenv("TERMUX_VERSION", "0.118.0")
++	resetTermuxBatteryCache()
++	t.Cleanup(resetTermuxBatteryCache)
++
++	calls := filepath.Join(tmp, "calls")
++	script := "#!/bin/sh\nprintf x >> " + filepath.Join(calls) + "\nexit 1\n"
++	pathDir := writeTermuxScript(t, filepath.Join(tmp, "bin"), script)
++	path := filepath.Join(pathDir, "termux-battery-status")
++
++	// Save and restore the package-level fetch hook so later tests exercise
++	// the real exec path.
++	oldFetch := termuxBatteryFetch
++	t.Cleanup(func() { termuxBatteryFetch = oldFetch })
++
++	c := &termuxBatteryCache{}
++	// One success first, so the cache has a reading to fall back on.
++	termuxBatteryFetch = func(string) ([]Battery, error) {
++		return []Battery{{Name: "Battery", Percent: 50, State: stateDischarging, System: true}}, nil
++	}
++	c.refreshOnce(path)
++	if len(c.batteries) != 1 || c.batteries[0].Percent != 50 {
++		t.Fatalf("expected refreshed 50%% reading, got %+v", c.batteries)
++	}
++
++	// Now point the hook at the failing script and refresh 3 times.
++	termuxBatteryFetch = func(string) ([]Battery, error) { return nil, errNoBatteries }
++	for i := 0; i < termuxBatteryMaxFailures; i++ {
++		c.refreshOnce(path)
++	}
++	if !c.disabled {
++		t.Fatal("expected circuit breaker to disable after repeated failures")
++	}
++	if c.failures < termuxBatteryMaxFailures {
++		t.Fatalf("expected >=%d recorded failures, got %d", termuxBatteryMaxFailures, c.failures)
++	}
++	// The refresher loop must stop when disabled (simulated by the caller
++	// checking c.disabled after refreshOnce).
++	if data, err := os.ReadFile(calls); err == nil {
++		if len(data) > termuxBatteryMaxFailures {
++			t.Fatalf("expected at most %d refresh attempts, got %d", termuxBatteryMaxFailures, len(data))
++		}
++	}
++	// getTermuxBatteryStats must refuse once disabled.
++	if _, err := getTermuxBatteryStats(); err == nil {
++		t.Fatal("expected error from disabled termux battery collection")
++	}
++}
++
++// TestTermuxFallbackSkippedOutsideTermux verifies that without
++// TERMUX_VERSION nothing is executed and the underlying sysfs error is
++// returned by GetBatteryStats.
++func TestTermuxFallbackSkippedOutsideTermux(t *testing.T) {
++	tmp := t.TempDir()
++	batteryRoot = filepath.Join(tmp, "missing_power_supply")
++	t.Cleanup(func() { batteryRoot = "/sys/class/power_supply" })
++	t.Setenv("TERMUX_VERSION", "")
++	resetTermuxBatteryCache()
++	t.Cleanup(resetTermuxBatteryCache)
++
++	writeTermuxScript(t, filepath.Join(tmp, "bin"), "#!/bin/sh\nexit 0\n")
++
++	_, err := GetBatteryStats()
++	if err == nil {
++		t.Fatal("expected error when sysfs is unavailable and TERMUX_VERSION is unset")
++	}
++	if _, ok := getTermuxBatteryStats(); ok == nil {
++		// getTermuxBatteryStats itself must also refuse without TERMUX_VERSION.
++		t.Fatal("expected termux collector to skip without TERMUX_VERSION")
++	}
++}
++
++// TestParseTermuxBattery covers the JSON parsing and state mapping table.
++func TestParseTermuxBattery(t *testing.T) {
++	cases := []struct {
++		name    string
++		json    string
++		percent uint8
++		state   uint8
++		wantErr bool
++	}{
++		{"rounding", `{"percentage":82.6,"status":"DISCHARGING"}`, 83, stateDischarging, false},
++		{"clamp high", `{"percentage":150,"status":"FULL"}`, 100, stateFull, false},
++		{"clamp low", `{"percentage":-5,"status":"EMPTY"}`, 0, stateEmpty, false},
++		{"not charging", `{"percentage":85,"status":"NOT_CHARGING"}`, 85, stateIdle, false},
++		{"unknown status", `{"percentage":85,"status":"WEIRD"}`, 85, stateUnknown, false},
++		{"missing percentage", `{"status":"CHARGING"}`, 0, 0, true},
++		{"bad json", `not json`, 0, 0, true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			battery, err := parseTermuxBattery([]byte(tc.json))
++			if tc.wantErr {
++				if err == nil {
++					t.Fatalf("expected error for %s", tc.json)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++			if battery.Percent != tc.percent {
++				t.Fatalf("expected percent %d, got %d", tc.percent, battery.Percent)
++			}
++			if battery.State != tc.state {
++				t.Fatalf("expected state %d, got %d", tc.state, battery.State)
++			}
++		})
++	}
++}
++
++// TestTermuxInitialFetchFailureBreaks verifies the circuit breaker across
++// initial (synchronous) fetches: three failing polls disable collection.
++func TestTermuxInitialFetchFailureBreaks(t *testing.T) {
++	tmp := t.TempDir()
++	batteryRoot = filepath.Join(tmp, "missing_power_supply")
++	t.Cleanup(func() { batteryRoot = "/sys/class/power_supply" })
++	t.Setenv("TERMUX_VERSION", "0.118.0")
++	resetTermuxBatteryCache()
++	t.Cleanup(resetTermuxBatteryCache)
++
++	calls := filepath.Join(tmp, "calls")
++	script := "#!/bin/sh\nprintf x >> " + filepath.Join(calls) + "\nprintf 'garbage'\n"
++	pathDir := writeTermuxScript(t, filepath.Join(tmp, "bin"), script)
++	t.Setenv("PATH", pathDir)
++
++	for i := 0; i < termuxBatteryMaxFailures; i++ {
++		if _, err := GetBatteryStats(); err == nil {
++			t.Fatal("expected failure while helper outputs garbage")
++		}
++	}
++	if data, err := os.ReadFile(calls); err != nil || len(data) != termuxBatteryMaxFailures {
++		t.Fatalf("expected exactly %d exec attempts, got %v", termuxBatteryMaxFailures, data)
++	}
++	// After the breaker trips, no further exec may happen.
++	writeTermuxScript(t, pathDir, "#!/bin/sh\nprintf x >> "+filepath.Join(calls)+"\nprintf '%s' '"+validTermuxJSON+"'\n")
++	if _, err := GetBatteryStats(); err == nil {
++		t.Fatal("expected disabled breaker to keep refusing")
++	}
++	if data, _ := os.ReadFile(calls); len(data) != termuxBatteryMaxFailures {
++		t.Fatalf("breaker must stop all exec attempts; calls=%d", len(data))
++	}
++}
++
++// TestRunTermuxCommand exercises the raw syscall.StartProcess runner that
++// replaced os/exec: os/exec probes pidfd_open before the first child start,
++// which Android < 12 seccomp answers with a fatal SIGSYS.
++func TestRunTermuxCommand(t *testing.T) {
++	if _, err := os.Stat("/bin/sh"); err != nil {
++		t.Skip("/bin/sh not available on this host")
++	}
++	ctx := context.Background()
++
++	// stdout capture
++	out, err := runTermuxCommand(ctx, "/bin/sh", "-c", "printf 'hello beszel'")
++	if err != nil {
++		t.Fatalf("expected success, got %v", err)
++	}
++	if string(out) != "hello beszel" {
++		t.Fatalf("expected %q, got %q", "hello beszel", out)
++	}
++
++	// nonzero exit: stderr tail must surface in the error
++	_, err = runTermuxCommand(ctx, "/bin/sh", "-c", "echo boom >&2; exit 3")
++	if err == nil || !strings.Contains(err.Error(), "exit status 3") || !strings.Contains(err.Error(), "boom") {
++		t.Fatalf("expected exit-status error carrying stderr, got %v", err)
++	}
++
++	// timeout: SIGKILL + reap; must return promptly and not leak the child
++	timeoutCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
++	defer cancel()
++	start := time.Now()
++	_, err = runTermuxCommand(timeoutCtx, "/bin/sh", "-c", "sleep 30")
++	if err == nil || !strings.Contains(err.Error(), "timed out") {
++		t.Fatalf("expected timeout error, got %v", err)
++	}
++	if elapsed := time.Since(start); elapsed > 5*time.Second {
++		t.Fatalf("timeout not enforced (took %s)", elapsed)
++	}
++
++	// shebang script (how the real termux-battery-status is executed)
++	script := filepath.Join(t.TempDir(), "termux-battery-status")
++	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' '"+validTermuxJSON+"'\n"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	out, err = runTermuxCommand(ctx, script)
++	if err != nil {
++		t.Fatalf("expected shebang script success, got %v", err)
++	}
++	if !strings.Contains(string(out), "percentage") {
++		t.Fatalf("expected JSON output, got %q", out)
++	}
++}
++
++// TestRunTermuxCommandNotFound verifies a missing binary produces an error
++// (not a crash) from the raw spawn path.
++func TestRunTermuxCommandNotFound(t *testing.T) {
++	_, err := runTermuxCommand(context.Background(), "/nonexistent/binary/path")
++	if err == nil {
++		t.Fatal("expected error for missing binary")
++	}
++	if !strings.Contains(err.Error(), "start") {
++		t.Fatalf("expected start error, got %v", err)
++	}
++}
+diff --git a/agent/cpu.go b/agent/cpu.go
+index b17b81f..46edaee 100644
+--- a/agent/cpu.go
++++ b/agent/cpu.go
+@@ -1,8 +1,11 @@
+ package agent
+ 
+ import (
++	"errors"
++	"log/slog"
+ 	"math"
+ 	"runtime"
++	"sync/atomic"
+ 
+ 	"github.com/henrygd/beszel/internal/entities/system"
+ 	"github.com/shirou/gopsutil/v4/cpu"
+@@ -11,6 +14,11 @@ import (
+ var lastCpuTimes = make(map[uint16]cpu.TimesStat)
+ var lastPerCoreCpuTimes = make(map[uint16][]cpu.TimesStat)
+ 
++// cpuZeroPolls counts consecutive default-interval polls that reported 0%
++// CPU without an error, so a persistently dead source is surfaced as a
++// warning instead of silently pinning the graph at zero forever.
++var cpuZeroPolls atomic.Int32
++
+ // init initializes the CPU monitoring by storing the initial CPU times
+ // for the default 60-second cache interval.
+ func init() {
+@@ -27,6 +35,50 @@ func init() {
+ 	}
+ }
+ 
++// noteCpuPollOutcome tracks consecutive zero-CPU polls at the default
++// interval and warns once when a dead source is suspected. A working CPU
++// source only ever reports brief zero readings, so several consecutive zero
++// polls mean the data source is producing nothing useful.
++func noteCpuPollOutcome(cacheTimeMs uint16, err error, cpuValue float64) {
++	if cacheTimeMs != defaultDataCacheTimeMs {
++		return
++	}
++	if err == nil && cpuValue == 0 {
++		if n := cpuZeroPolls.Add(1); n == 3 {
++			slog.Warn("CPU reported 0% for 3 consecutive polls",
++				"hint", "run with LOG_LEVEL=debug to inspect CPU sampling",
++				"android_hint", "on Termux the CPU fallback needs readable /proc/[pid]/stat or cpufreq stats")
++		}
++		return
++	}
++	cpuZeroPolls.Store(0)
++}
++
++// seedFallbackBaseline replaces a missing or all-zero baseline with the
++// fallback sample, so the next poll produces a real delta instead of either
++// a garbage delta against a dead all-zero gopsutil baseline or an
++// average-since-boot value.
++func seedFallbackBaseline(cacheTimeMs uint16, sample cpu.TimesStat) {
++	if cur, ok := lastCpuTimes[60000]; !ok || cpuTimesAllZero(cur) {
++		slog.Debug("cpu: seeding missing/dead baseline from android fallback sample")
++		lastCpuTimes[60000] = sample
++		lastCpuTimes[cacheTimeMs] = sample
++	}
++}
++
++// seedFallbackPerCoreBaseline is seedFallbackBaseline for the per-core map:
++// it seeds when the baseline is missing, has the wrong core count, or is
++// all-zero (dead /proc/stat counters).
++func seedFallbackPerCoreBaseline(cacheTimeMs uint16, samples []cpu.TimesStat) {
++	baseline, ok := lastPerCoreCpuTimes[60000]
++	if ok && len(baseline) == len(samples) && len(baseline) > 0 && !cpuTimesAllZero(baseline[0]) {
++		return
++	}
++	slog.Debug("cpu: seeding missing/dead per-core baseline from android fallback samples")
++	lastPerCoreCpuTimes[60000] = samples
++	lastPerCoreCpuTimes[cacheTimeMs] = samples
++}
++
+ // CpuMetrics contains detailed CPU usage breakdown
+ type CpuMetrics struct {
+ 	Total   float64
+@@ -53,18 +105,30 @@ func getCpuMetrics(cacheTimeMs uint16, forceUseCgroup bool) (CpuMetrics, error)
+ 		return metrics, nil
+ 	}
+ 	times, err := cpu.Times(false)
+-	if (err != nil || len(times) == 0) && androidNoProcStat() {
++	if androidNoProcStat() && (err != nil || len(times) == 0 || cpuTimesAllZero(times[0])) {
+ 		// Unrooted Android fallback (henrygd/beszel#2346): synthesize
+ 		// cumulative counters from process ticks or cpufreq residency.
++		// The fallback also engages when gopsutil "succeeds" but /proc/stat
++		// reads back all-zero counters (restricted kernels), which would
++		// otherwise silently pin the reported CPU at 0%.
+ 		if fallback, ferr := androidCpuTimes(false); ferr == nil && len(fallback) > 0 {
++			slog.Debug("cpu: android fallback sample", "busy_seconds", fallback[0].User, "idle_seconds", fallback[0].Idle)
++			seedFallbackBaseline(cacheTimeMs, fallback[0])
+ 			return cpuMetricsFromTimes(cacheTimeMs, fallback[0]), nil
+ 		} else if ferr != nil {
++			slog.Debug("cpu: android fallback failed", "err", ferr)
+ 			return CpuMetrics{}, ferr
+ 		}
+ 	}
+ 	if err != nil || len(times) == 0 {
++		if err == nil {
++			// Make an empty-but-successful cpu.Times visible instead of
++			// silently publishing zero CPU forever.
++			err = errors.New("cpu.Times returned no data")
++		}
+ 		return CpuMetrics{}, err
+ 	}
++	slog.Debug("cpu: gopsutil sample", "user_seconds", times[0].User, "idle_seconds", times[0].Idle)
+ 	return cpuMetricsFromTimes(cacheTimeMs, times[0]), nil
+ }
+ 
+@@ -86,6 +150,7 @@ func cpuMetricsFromTimes(cacheTimeMs uint16, current cpu.TimesStat) CpuMetrics {
+ 
+ 	totalDelta := t2All - t1All
+ 	if totalDelta <= 0 {
++		slog.Debug("cpu: delta not positive; reporting zero", "t1_all", t1All, "t2_all", t2All, "total_delta", totalDelta)
+ 		return CpuMetrics{}
+ 	}
+ 
+@@ -101,6 +166,7 @@ func cpuMetricsFromTimes(cacheTimeMs uint16, current cpu.TimesStat) CpuMetrics {
+ 		Nice:    clampPercent((t2.Nice - t1.Nice) / totalDelta * 100),
+ 	}
+ 
++	slog.Debug("cpu: metrics", "total", metrics.Total, "user", metrics.User, "system", metrics.System, "total_delta", totalDelta)
+ 	return metrics
+ }
+ 
+@@ -113,16 +179,21 @@ func clampPercent(value float64) float64 {
+ // It uses cached previous measurements for the provided cache interval.
+ func getPerCoreCpuUsage(cacheTimeMs uint16) (system.Uint8Slice, error) {
+ 	perCoreTimes, err := cpu.Times(true)
+-	if (err != nil || len(perCoreTimes) == 0) && androidNoProcStat() {
++	if androidNoProcStat() && (err != nil || len(perCoreTimes) == 0 || cpuTimesAllZero(perCoreTimes[0])) {
+ 		// Unrooted Android fallback (henrygd/beszel#2346).
+ 		if fallback, ferr := androidCpuTimes(true); ferr == nil && len(fallback) > 0 {
++			seedFallbackPerCoreBaseline(cacheTimeMs, fallback)
+ 			perCoreTimes = fallback
+ 			err = nil
+ 		} else if ferr != nil {
++			slog.Debug("cpu: android per-core fallback failed", "err", ferr)
+ 			return nil, ferr
+ 		}
+ 	}
+ 	if err != nil || len(perCoreTimes) == 0 {
++		if err != nil {
++			slog.Debug("cpu: per-core times unavailable", "err", err)
++		}
+ 		return nil, err
+ 	}
+ 
+@@ -144,6 +215,7 @@ func getPerCoreCpuUsage(cacheTimeMs uint16) (system.Uint8Slice, error) {
+ 	}
+ 
+ 	lastPerCoreCpuTimes[cacheTimeMs] = perCoreTimes
++	slog.Debug("cpu: per-core usage", "cores", length, "usage", usage)
+ 	return usage, nil
+ }
+ 
+diff --git a/agent/cpu_fallback.go b/agent/cpu_fallback.go
+index 4e04928..ad6dc6b 100644
+--- a/agent/cpu_fallback.go
++++ b/agent/cpu_fallback.go
+@@ -25,53 +25,95 @@ package agent
+ // existing delta logic (cpuMetricsFromTimes / calculateBusy) works unchanged.
+ 
+ import (
+-	"errors"
+-	"log/slog"
+-	"os"
+-	"path/filepath"
+-	"runtime"
+-	"sort"
+-	"strconv"
+-	"strings"
+-	"sync"
+-	"syscall"
+-	"time"
+-
+-	"github.com/shirou/gopsutil/v4/cpu"
++        "errors"
++        "log/slog"
++        "os"
++        "path/filepath"
++        "runtime"
++        "sort"
++        "strconv"
++        "strings"
++        "sync"
++        "syscall"
++        "time"
++
++        "github.com/henrygd/beszel/agent/utils"
++        "github.com/shirou/gopsutil/v4/cpu"
+ )
+ 
+ // Hooks so tests can point at fixture paths / fake clocks.
+ var (
+-	androidProcStatPath  = "/proc/stat"
+-	androidSysCpuRoot    = "/sys/devices/system/cpu"
+-	androidProcPidRoot   = "/proc"
+-	androidClockNow      = time.Now
+-	androidClockTickRate = 100.0 // USER_HZ jiffies per second in /proc/*/stat
++        androidProcStatPath  = "/proc/stat"
++        androidSysCpuRoot    = "/sys/devices/system/cpu"
++        androidProcPidRoot   = "/proc"
++        androidClockNow      = time.Now
++        androidClockTickRate = 100.0 // USER_HZ jiffies per second in /proc/*/stat
+ )
+ 
+-// androidNoProcStat is cached: true when /proc/stat is unreadable in this
+-// environment (unrooted Android), meaning gopsutil's default source can
+-// never work and the fallback should be used.
+-var androidNoProcStat = sync.OnceValue(func() bool {
+-	if runtime.GOOS != "linux" {
+-		return false
+-	}
+-	_, statErr := os.ReadFile(androidProcStatPath)
+-	return statErr != nil
+-})
++// androidNoProcStat is cached: true when /proc/stat cannot provide usable
++// counters in this environment — either unreadable (unrooted Android,
++// SELinux denial) or readable but empty/zeroed (some restricted kernels
++// serve an empty or dead /proc/stat, which would pin gopsutil at 0% forever)
++// — meaning gopsutil's default source can never work and the fallback should
++// be used.
++//
++// Both GOOS=linux and GOOS=android builds are supported: a plain `go build`
++// inside Termux produces a GOOS=android binary (gopsutil's cpu.Times is not
++// implemented there), so the fallback must engage under both.
++var androidNoProcStat = sync.OnceValue(androidNoProcStatCheck)
++
++// androidNoProcStatCheck is the gate body, kept as a named function so tests
++// can rebuild the cached gate against fixture paths.
++func androidNoProcStatCheck() bool {
++        if runtime.GOOS != "linux" && runtime.GOOS != "android" {
++                return false
++        }
++        data, statErr := os.ReadFile(androidProcStatPath)
++        if statErr != nil {
++                return true // unreadable: SELinux-denied on unrooted Android
++        }
++        return !procStatHasUsableData(data) // readable but dead: engage fallback
++}
++
++// procStatHasUsableData reports whether /proc/stat content contains an
++// aggregate "cpu" line with at least one non-zero counter. A file that reads
++// back empty or all-zero can never produce a meaningful CPU delta, so it is
++// treated as unavailable rather than silently reporting 0% forever.
++func procStatHasUsableData(data []byte) bool {
++        for line := range strings.SplitSeq(string(data), "\n") {
++                fields := strings.Fields(line)
++                if len(fields) < 2 || fields[0] != "cpu" {
++                        continue
++                }
++                for _, f := range fields[1:] {
++                        if v, err := strconv.ParseFloat(f, 64); err == nil && v > 0 {
++                                return true
++                        }
++                }
++                return false // aggregate line present but every counter is zero
++        }
++        return false // no aggregate "cpu" line at all
++}
++
++// cpuTimesAllZero reports whether every counter in t is zero: gopsutil
++// "succeeded" but the data is dead (readable-but-restricted /proc/stat),
++// which would otherwise silently pin the reported CPU at 0%.
++func cpuTimesAllZero(t cpu.TimesStat) bool {
++        return t.User+t.System+t.Idle+t.Nice+t.Iowait+t.Irq+t.Softirq+t.Steal+t.Guest+t.GuestNice == 0
++}
+ 
+ // androidCpuState keeps cumulative counters between samples so each call can
+ // produce monotonically increasing TimesStat values, matching gopsutil.
+ type androidCpuState struct {
+-	cumBusy float64 // cumulative busy seconds (all cores)
+-	cumWall float64 // cumulative wall-clock seconds × core count
+-	at      time.Time
++        cumBusy float64 // cumulative busy seconds (all cores)
++        cumWall float64 // cumulative wall-clock seconds × core count
++        at      time.Time
+ }
+ 
+ var (
+-	androidMu      sync.Mutex
+-	androidTotal   androidCpuState   // for cpu.Times(false)
+-	androidPerCore []androidCpuState // per core, for cpu.Times(true)
++        androidMu      sync.Mutex
++        androidTotal   androidCpuState   // for cpu.Times(false)
++        androidPerCore []androidCpuState // per core, for cpu.Times(true)
+ )
+ 
+ // androidCpuTimes returns cumulative CPU-time counters synthesized from
+@@ -81,34 +123,34 @@ var (
+ // beszel's baseline-seeding logic expects, and a non-nil error only when no
+ // data source works at all.
+ func androidCpuTimes(perCore bool) ([]cpu.TimesStat, error) {
+-	androidMu.Lock()
+-	defer androidMu.Unlock()
+-
+-	now := androidClockNow()
+-	cores := runtime.NumCPU()
+-	if cores <= 0 {
+-		cores = 1
+-	}
+-
+-	// Sample busy time per core. cpufreq data is per core; the process-tick
+-	// strategy yields one aggregate that we split evenly across cores.
+-	perCoreBusy := androidSampleBusyPerCore(now, cores)
+-	if len(perCoreBusy) == 0 {
+-		return nil, errNoAndroidCpuSource
+-	}
+-
+-	if perCore {
+-		if len(perCoreBusy) != cores {
+-			// Align the per-core baseline with whatever the source exposes
+-			// (e.g. some cores lack cpufreq stats).
+-			if len(perCoreBusy) == 0 {
+-				return nil, errNoAndroidCpuSource
+-			}
+-			cores = len(perCoreBusy)
+-		}
+-		return androidBuildPerCore(perCoreBusy, now, cores), nil
+-	}
+-	return androidBuildTotal(perCoreBusy, now, cores), nil
++        androidMu.Lock()
++        defer androidMu.Unlock()
++
++        now := androidClockNow()
++        cores := runtime.NumCPU()
++        if cores <= 0 {
++                cores = 1
++        }
++
++        // Sample busy time per core. cpufreq data is per core; the process-tick
++        // strategy yields one aggregate that we split evenly across cores.
++        perCoreBusy := androidSampleBusyPerCore(now, cores)
++        if len(perCoreBusy) == 0 {
++                return nil, errNoAndroidCpuSource
++        }
++
++        if perCore {
++                if len(perCoreBusy) != cores {
++                        // Align the per-core baseline with whatever the source exposes
++                        // (e.g. some cores lack cpufreq stats).
++                        if len(perCoreBusy) == 0 {
++                                return nil, errNoAndroidCpuSource
++                        }
++                        cores = len(perCoreBusy)
++                }
++                return androidBuildPerCore(perCoreBusy, now, cores), nil
++        }
++        return androidBuildTotal(perCoreBusy, now, cores), nil
+ }
+ 
+ // errNoAndroidCpuSource is returned when neither cpufreq nor process ticks
+@@ -118,98 +160,103 @@ var errNoAndroidCpuSource = errors.New("no readable CPU data source (cpufreq/tim
+ // androidBuildTotal converts the per-core busy snapshot into a single
+ // aggregated cumulative TimesStat.
+ func androidBuildTotal(perCoreBusy []float64, now time.Time, cores int) []cpu.TimesStat {
+-	var busySum float64
+-	for _, b := range perCoreBusy {
+-		busySum += b
+-	}
+-
+-	// Baseline per-core list must exist to seed wall time on first call.
+-	prevTotal := androidTotal
+-	if prevTotal.at.IsZero() {
+-		androidTotal = androidCpuState{cumBusy: busySum, cumWall: 0, at: now}
+-		return []cpu.TimesStat{}
+-	}
+-
+-	elapsed := now.Sub(prevTotal.at).Seconds()
+-	if elapsed <= 0 {
+-		return []cpu.TimesStat{}
+-	}
+-	wallDelta := elapsed * float64(cores)
+-	busyDelta := clampAndroid(busySum-prevTotal.cumBusy, wallDelta)
+-
+-	androidTotal = androidCpuState{
+-		cumBusy: prevTotal.cumBusy + busyDelta,
+-		cumWall: prevTotal.cumWall + wallDelta,
+-		at:      now,
+-	}
+-	cur := androidTotal
+-	return []cpu.TimesStat{{
+-		User: cur.cumBusy,
+-		Idle: cur.cumWall - cur.cumBusy,
+-	}}
++        var busySum float64
++        for _, b := range perCoreBusy {
++                busySum += b
++        }
++
++        // Baseline per-core list must exist to seed wall time on first call.
++        prevTotal := androidTotal
++        if prevTotal.at.IsZero() {
++                slog.Debug("android CPU: seeding aggregate baseline", "busy_seconds", busySum)
++                androidTotal = androidCpuState{cumBusy: busySum, cumWall: 0, at: now}
++                return []cpu.TimesStat{}
++        }
++
++        elapsed := now.Sub(prevTotal.at).Seconds()
++        if elapsed <= 0 {
++                slog.Debug("android CPU: non-positive elapsed; skipping sample", "elapsed", elapsed)
++                return []cpu.TimesStat{}
++        }
++        wallDelta := elapsed * float64(cores)
++        busyDelta := clampAndroid(busySum-prevTotal.cumBusy, wallDelta)
++        slog.Debug("android CPU: aggregate sample", "busy_delta", busyDelta, "wall_delta", wallDelta, "elapsed", elapsed)
++
++        androidTotal = androidCpuState{
++                cumBusy: prevTotal.cumBusy + busyDelta,
++                cumWall: prevTotal.cumWall + wallDelta,
++                at:      now,
++        }
++        cur := androidTotal
++        return []cpu.TimesStat{{
++                User: cur.cumBusy,
++                Idle: cur.cumWall - cur.cumBusy,
++        }}
+ }
+ 
+ // androidBuildPerCore converts the busy snapshot into per-core cumulative
+ // TimesStat entries. Cores without cpufreq data get the average busy share.
+ func androidBuildPerCore(perCoreBusy []float64, now time.Time, cores int) []cpu.TimesStat {
+-	if len(androidPerCore) != cores {
+-		// Core count changed (hotplug) or first call: reset baseline.
+-		androidPerCore = make([]androidCpuState, cores)
+-		for i := range androidPerCore {
+-			androidPerCore[i].at = now
+-			androidPerCore[i].cumBusy = perCoreBusy[i]
+-		}
+-		return []cpu.TimesStat{}
+-	}
+-
+-	elapsed := now.Sub(androidPerCore[0].at).Seconds()
+-	if elapsed <= 0 {
+-		return []cpu.TimesStat{}
+-	}
+-
+-	out := make([]cpu.TimesStat, cores)
+-	for i := 0; i < cores; i++ {
+-		prev := androidPerCore[i]
+-		wallDelta := elapsed
+-		busyDelta := clampAndroid(perCoreBusy[i]-prev.cumBusy, wallDelta)
+-		androidPerCore[i] = androidCpuState{
+-			cumBusy: prev.cumBusy + busyDelta,
+-			cumWall: prev.cumWall + wallDelta,
+-			at:      now,
+-		}
+-		cur := androidPerCore[i]
+-		out[i] = cpu.TimesStat{
+-			User: cur.cumBusy,
+-			Idle: cur.cumWall - cur.cumBusy,
+-		}
+-	}
+-	return out
++        if len(androidPerCore) != cores {
++                // Core count changed (hotplug) or first call: reset baseline.
++                slog.Debug("android CPU: seeding per-core baseline", "cores", cores)
++                androidPerCore = make([]androidCpuState, cores)
++                for i := range androidPerCore {
++                        androidPerCore[i].at = now
++                        androidPerCore[i].cumBusy = perCoreBusy[i]
++                }
++                return []cpu.TimesStat{}
++        }
++
++        elapsed := now.Sub(androidPerCore[0].at).Seconds()
++        if elapsed <= 0 {
++                slog.Debug("android CPU: non-positive per-core elapsed; skipping sample", "elapsed", elapsed)
++                return []cpu.TimesStat{}
++        }
++
++        out := make([]cpu.TimesStat, cores)
++        for i := 0; i < cores; i++ {
++                prev := androidPerCore[i]
++                wallDelta := elapsed
++                busyDelta := clampAndroid(perCoreBusy[i]-prev.cumBusy, wallDelta)
++                androidPerCore[i] = androidCpuState{
++                        cumBusy: prev.cumBusy + busyDelta,
++                        cumWall: prev.cumWall + wallDelta,
++                        at:      now,
++                }
++                cur := androidPerCore[i]
++                out[i] = cpu.TimesStat{
++                        User: cur.cumBusy,
++                        Idle: cur.cumWall - cur.cumBusy,
++                }
++        }
++        return out
+ }
+ 
+ // clampAndroid clamps a delta to [0, max].
+ func clampAndroid(delta, max float64) float64 {
+-	if delta < 0 {
+-		return 0
+-	}
+-	if delta > max {
+-		return max
+-	}
+-	return delta
++        if delta < 0 {
++                return 0
++        }
++        if delta > max {
++                return max
++        }
++        return delta
+ }
+ 
+ // androidLastRaw keeps the previous raw cpufreq counters per core so busy
+ // time can be derived from unit-independent ratios instead of absolute
+ // counts (whose units and idle-accounting semantics vary by kernel).
+ type androidRawSamples struct {
+-	total []float64 // cumulative residency across all frequencies
+-	min   []float64 // cumulative residency at the lowest frequency
+-	ok    bool
+-	at    time.Time
++        total []float64 // cumulative residency across all frequencies
++        min   []float64 // cumulative residency at the lowest frequency
++        ok    bool
++        at    time.Time
+ }
+ 
+ var (
+-	androidLastRaw androidRawSamples
+-	androidCumBusy []float64 // accumulated busy seconds per core
++        androidLastRaw androidRawSamples
++        androidCumBusy []float64 // accumulated busy seconds per core
+ )
+ 
+ // androidSourceLogged ensures the active fallback source is reported once.
+@@ -218,41 +265,44 @@ var androidSourceLogged sync.Once
+ // androidSampleBusyPerCore reads cumulative busy seconds per core.
+ // Returns nil when no source is readable at all.
+ func androidSampleBusyPerCore(now time.Time, cores int) []float64 {
+-	// Strategy 1: process ticks, aggregated then split evenly. Genuine
+-	// busy seconds (utime/stime at USER_HZ), no unit guessing — matches
+-	// what toybox top reports in the same environment.
+-	if busy, found := androidProcessTicks(); found {
+-		androidSourceLogged.Do(func() {
+-			slog.Info("android CPU fallback: using process ticks (/proc/[pid]/stat)")
+-		})
+-		samples := make([]float64, cores)
+-		for i := range samples {
+-			samples[i] = busy / float64(cores)
+-		}
+-		return samples
+-	}
+-
+-	// Strategy 2: cpufreq time_in_state residency ratios, per core.
+-	dirs := androidCpuDirs()
+-	if len(dirs) > 0 {
+-		totals := make([]float64, len(dirs))
+-		mins := make([]float64, len(dirs))
+-		ok := 0
+-		for i, dir := range dirs {
+-			t, m, got := androidTimeInStateBusy(dir)
+-			totals[i], mins[i] = t, m
+-			if got {
+-				ok++
+-			}
+-		}
+-		if ok > 0 {
+-			androidSourceLogged.Do(func() {
+-				slog.Info("android CPU fallback: using cpufreq residency ratios")
+-			})
+-			return androidAccumulateBusy(totals, mins, now)
+-		}
+-	}
+-	return nil
++        // Strategy 1: process ticks, aggregated then split evenly. Genuine
++        // busy seconds (utime/stime at USER_HZ), no unit guessing — matches
++        // what toybox top reports in the same environment.
++        if busy, pids, found := androidProcessTicks(); found {
++                androidSourceLogged.Do(func() {
++                        slog.Info("android CPU fallback: using process ticks (/proc/[pid]/stat)")
++                })
++                slog.Debug("android CPU: process tick sample", "busy_seconds", busy, "readable_pids", pids, "cores", cores)
++                samples := make([]float64, cores)
++                for i := range samples {
++                        samples[i] = busy / float64(cores)
++                }
++                return samples
++        }
++
++        // Strategy 2: cpufreq time_in_state residency ratios, per core.
++        dirs := androidCpuDirs()
++        if len(dirs) > 0 {
++                totals := make([]float64, len(dirs))
++                mins := make([]float64, len(dirs))
++                ok := 0
++                for i, dir := range dirs {
++                        t, m, got := androidTimeInStateBusy(dir)
++                        totals[i], mins[i] = t, m
++                        if got {
++                                ok++
++                        }
++                }
++                if ok > 0 {
++                        androidSourceLogged.Do(func() {
++                                slog.Info("android CPU fallback: using cpufreq residency ratios")
++                        })
++                        slog.Debug("android CPU: cpufreq residency sample", "cores_with_stats", ok, "cpu_dirs", len(dirs))
++                        return androidAccumulateBusy(totals, mins, now)
++                }
++        }
++        slog.Debug("android CPU: no readable source", "proc_root", androidProcPidRoot, "sys_root", androidSysCpuRoot)
++        return nil
+ }
+ 
+ // androidAccumulateBusy converts raw cpufreq residency counters into
+@@ -266,77 +316,78 @@ func androidSampleBusyPerCore(now time.Time, cores int) []float64 {
+ //
+ // Instead we use the standard Android frequency-ratio heuristic:
+ //
+-//	idle fraction ≈ residency at the LOWEST frequency / total residency
+-//	busy fraction = 1 - idle fraction
++//      idle fraction ≈ residency at the LOWEST frequency / total residency
++//      busy fraction = 1 - idle fraction
+ //
+ // The governor parks an idle core at its lowest frequency and raises the
+ // frequency under load, so the ratio tracks utilization regardless of the
+ // counter unit. Busy seconds = busy fraction × elapsed wall time.
+ func androidAccumulateBusy(totals, mins []float64, now time.Time) []float64 {
+-	sameShape := androidLastRaw.ok && len(androidLastRaw.total) == len(totals)
+-	elapsed := 0.0
+-	if sameShape {
+-		elapsed = now.Sub(androidLastRaw.at).Seconds()
+-		if elapsed <= 0 {
+-			// Clock went backwards or sampled too fast; keep prior cumulative.
+-			androidLastRaw.total, androidLastRaw.min, androidLastRaw.at = totals, mins, now
+-			return androidCumBusy
+-		}
+-	}
+-	if len(androidCumBusy) != len(totals) {
+-		androidCumBusy = make([]float64, len(totals))
+-	}
+-	if sameShape {
+-		for i := range totals {
+-			dTotal := totals[i] - androidLastRaw.total[i]
+-			dMin := mins[i] - androidLastRaw.min[i]
+-			usage := androidUsageRatio(dTotal, dMin)
+-			androidCumBusy[i] += usage * elapsed
+-		}
+-	}
+-	// First sample: baseline only; cumulative stays where it is and real
+-	// deltas begin on the next call, matching the seeding behavior of the
+-	// rest of the fallback.
+-	androidLastRaw.total, androidLastRaw.min, androidLastRaw.ok, androidLastRaw.at = totals, mins, true, now
+-	return androidCumBusy
++        sameShape := androidLastRaw.ok && len(androidLastRaw.total) == len(totals)
++        elapsed := 0.0
++        if sameShape {
++                elapsed = now.Sub(androidLastRaw.at).Seconds()
++                if elapsed <= 0 {
++                        // Clock went backwards or sampled too fast; keep prior cumulative.
++                        androidLastRaw.total, androidLastRaw.min, androidLastRaw.at = totals, mins, now
++                        return androidCumBusy
++                }
++        }
++        if len(androidCumBusy) != len(totals) {
++                androidCumBusy = make([]float64, len(totals))
++        }
++        if sameShape {
++                for i := range totals {
++                        dTotal := totals[i] - androidLastRaw.total[i]
++                        dMin := mins[i] - androidLastRaw.min[i]
++                        usage := androidUsageRatio(dTotal, dMin)
++                        androidCumBusy[i] += usage * elapsed
++                }
++        }
++        // First sample: baseline only; cumulative stays where it is and real
++        // deltas begin on the next call, matching the seeding behavior of the
++        // rest of the fallback.
++        androidLastRaw.total, androidLastRaw.min, androidLastRaw.ok, androidLastRaw.at = totals, mins, true, now
++        return androidCumBusy
+ }
+ 
+ // androidUsageRatio computes the busy fraction of one core from residency
+ // deltas: (total - lowest-freq) / total, clamped to [0,1]. A zero or
+ // negative total delta (idle-saturated counter or hotplug gap) reports 0.
+ func androidUsageRatio(dTotal, dMin float64) float64 {
+-	if dTotal <= 0 {
+-		return 0
+-	}
+-	idle := dMin / dTotal
+-	if idle < 0 {
+-		idle = 0
+-	}
+-	if idle > 1 {
+-		idle = 1
+-	}
+-	return 1 - idle
++        if dTotal <= 0 {
++                return 0
++        }
++        idle := dMin / dTotal
++        if idle < 0 {
++                idle = 0
++        }
++        if idle > 1 {
++                idle = 1
++        }
++        return 1 - idle
+ }
+ 
+ // androidCpuDirs lists /sys/devices/system/cpu/cpuN directories, sorted.
+ func androidCpuDirs() []string {
+-	entries, err := os.ReadDir(androidSysCpuRoot)
+-	if err != nil {
+-		return nil
+-	}
+-	var dirs []string
+-	for _, e := range entries {
+-		name := e.Name()
+-		if !strings.HasPrefix(name, "cpu") {
+-			continue
+-		}
+-		if _, err := strconv.Atoi(strings.TrimPrefix(name, "cpu")); err != nil {
+-			continue
+-		}
+-		dirs = append(dirs, filepath.Join(androidSysCpuRoot, name))
+-	}
+-	sort.Strings(dirs)
+-	return dirs
++        entries, err := os.ReadDir(androidSysCpuRoot)
++        if err != nil {
++                slog.Debug("android CPU: sysfs cpu root unreadable", "path", androidSysCpuRoot, "err", err)
++                return nil
++        }
++        var dirs []string
++        for _, e := range entries {
++                name := e.Name()
++                if !strings.HasPrefix(name, "cpu") {
++                        continue
++                }
++                if _, err := strconv.Atoi(strings.TrimPrefix(name, "cpu")); err != nil {
++                        continue
++                }
++                dirs = append(dirs, filepath.Join(androidSysCpuRoot, name))
++        }
++        sort.Strings(dirs)
++        return dirs
+ }
+ 
+ // androidTimeInStateBusy reads one core's time_in_state file and returns
+@@ -344,97 +395,176 @@ func androidCpuDirs() []string {
+ // lowest frequency, found). Units are kernel-internal and deliberately NOT
+ // converted to seconds — only ratios of these values are ever used.
+ func androidTimeInStateBusy(cpuDir string) (float64, float64, bool) {
+-	data, err := os.ReadFile(filepath.Join(cpuDir, "cpufreq", "stats", "time_in_state"))
+-	if err != nil {
+-		return 0, 0, false
+-	}
+-	var total, minFreq, minCount float64
+-	minFreq = -1
+-	found := false
+-	for line := range strings.SplitSeq(string(data), "\n") {
+-		fields := strings.Fields(line)
+-		if len(fields) < 2 {
+-			continue
+-		}
+-		freq, err := strconv.ParseFloat(fields[0], 64)
+-		if err != nil {
+-			continue
+-		}
+-		count, err := strconv.ParseFloat(fields[1], 64)
+-		if err != nil {
+-			continue
+-		}
+-		total += count
+-		if minFreq < 0 || freq < minFreq {
+-			minFreq = freq
+-			minCount = count
+-		}
+-		found = true
+-	}
+-	return total, minCount, found
++        data, err := os.ReadFile(filepath.Join(cpuDir, "cpufreq", "stats", "time_in_state"))
++        if err != nil {
++                return 0, 0, false
++        }
++        var total, minFreq, minCount float64
++        minFreq = -1
++        found := false
++        for line := range strings.SplitSeq(string(data), "\n") {
++                fields := strings.Fields(line)
++                if len(fields) < 2 {
++                        continue
++                }
++                freq, err := strconv.ParseFloat(fields[0], 64)
++                if err != nil {
++                        continue
++                }
++                count, err := strconv.ParseFloat(fields[1], 64)
++                if err != nil {
++                        continue
++                }
++                total += count
++                if minFreq < 0 || freq < minFreq {
++                        minFreq = freq
++                        minCount = count
++                }
++                found = true
++        }
++        return total, minCount, found
+ }
+ 
+ // androidProcessTicks sums utime+stime (fields 14, 15) across every readable
+-// /proc/[pid]/stat, converted to seconds via USER_HZ.
+-func androidProcessTicks() (float64, bool) {
+-	entries, err := os.ReadDir(androidProcPidRoot)
+-	if err != nil {
+-		return 0, false
+-	}
+-	var total float64
+-	found := false
+-	for _, e := range entries {
+-		if !isPidName(e.Name()) {
+-			continue
+-		}
+-		data, err := os.ReadFile(filepath.Join(androidProcPidRoot, e.Name(), "stat"))
+-		if err != nil {
+-			continue
+-		}
+-		// The comm field is parenthesized and may contain spaces; split after it.
+-		close := strings.LastIndexByte(string(data), ')')
+-		if close < 0 {
+-			continue
+-		}
+-		fields := strings.Fields(string(data)[close+1:])
+-		// After ')' the first field is state; utime/stime are fields 11/12
+-		// (0-based) of the remainder.
+-		if len(fields) < 13 {
+-			continue
+-		}
+-		utime, err1 := strconv.ParseFloat(fields[11], 64)
+-		stime, err2 := strconv.ParseFloat(fields[12], 64)
+-		if err1 != nil || err2 != nil {
+-			continue
+-		}
+-		total += utime + stime
+-		found = true
+-	}
+-	return total / androidClockTickRate, found
++// /proc/[pid]/stat, converted to seconds via USER_HZ. It also reports how
++// many PID stat files were readable, purely for debug visibility. The
++// function is read-only (no shared state) and safe to call without holding
++// androidMu.
++func androidProcessTicks() (float64, int, bool) {
++        entries, err := os.ReadDir(androidProcPidRoot)
++        if err != nil {
++                slog.Debug("android CPU: /proc root unreadable", "path", androidProcPidRoot, "err", err)
++                return 0, 0, false
++        }
++        var total float64
++        var readable int
++        found := false
++        for _, e := range entries {
++                if !isPidName(e.Name()) {
++                        continue
++                }
++                data, err := os.ReadFile(filepath.Join(androidProcPidRoot, e.Name(), "stat"))
++                if err != nil {
++                        continue
++                }
++                // The comm field is parenthesized and may contain spaces; split after it.
++                close := strings.LastIndexByte(string(data), ')')
++                if close < 0 {
++                        continue
++                }
++                fields := strings.Fields(string(data)[close+1:])
++                // After ')' the first field is state; utime/stime are fields 11/12
++                // (0-based) of the remainder.
++                if len(fields) < 13 {
++                        continue
++                }
++                utime, err1 := strconv.ParseFloat(fields[11], 64)
++                stime, err2 := strconv.ParseFloat(fields[12], 64)
++                if err1 != nil || err2 != nil {
++                        continue
++                }
++                total += utime + stime
++                found = true
++                readable++
++        }
++        return total / androidClockTickRate, readable, found
+ }
+ 
+ // isPidName reports whether a /proc entry name is a numeric PID.
+ func isPidName(name string) bool {
+-	_, err := strconv.Atoi(name)
+-	return err == nil
++        _, err := strconv.Atoi(name)
++        return err == nil
+ }
+ 
+ // androidLoadAvg synthesizes load averages from the sysinfo(2) syscall when
+ // /proc/loadavg is unreadable. Kernel loads are fixed-point with
+ // SI_LOAD_SHIFT = 16 bits of fraction.
+ func androidLoadAvg() ([3]float64, bool) {
+-	var si syscall.Sysinfo_t
+-	if err := syscall.Sysinfo(&si); err != nil {
+-		return [3]float64{}, false
+-	}
+-	const siLoadShift = 16
+-	loads := [3]float64{}
+-	for i, raw := range si.Loads {
+-		if i > 2 {
+-			break
+-		}
+-		loads[i] = float64(uint64(raw)) / float64(uint64(1)<<siLoadShift)
+-	}
+-	slog.Debug("androidLoadAvg fallback", "load1", loads[0], "load5", loads[1])
+-	return loads, true
++        var si syscall.Sysinfo_t
++        if err := syscall.Sysinfo(&si); err != nil {
++                return [3]float64{}, false
++        }
++        const siLoadShift = 16
++        loads := [3]float64{}
++        for i, raw := range si.Loads {
++                if i > 2 {
++                        break
++                }
++                loads[i] = float64(uint64(raw)) / float64(uint64(1)<<siLoadShift)
++        }
++        slog.Debug("androidLoadAvg fallback", "load1", loads[0], "load5", loads[1])
++        return loads, true
++}
++
++// logCpuSourceDiagnostics reports, once at startup, why each CPU source is
++// or is not usable. On unrooted Android the classic failure mode is a
++// SILENT 0% CPU, so every decision point is made visible in the log.
++func logCpuSourceDiagnostics() {
++        if runtime.GOOS != "linux" && runtime.GOOS != "android" {
++                slog.Warn("cpu: not a linux/android build; android CPU fallback disabled",
++                        "goos", runtime.GOOS,
++                        "note", "the beszel agent for Termux must be built with GOOS=linux GOARCH=arm64")
++                return
++        }
++        if runtime.GOOS == "android" {
++                slog.Info("cpu: built with GOOS=android (native Termux build) — CPU fallback supported")
++        }
++        if _, exists := os.LookupEnv("TERMUX_VERSION"); exists {
++                slog.Info("cpu: termux environment detected (TERMUX_VERSION is set)")
++        }
++        data, statErr := os.ReadFile(androidProcStatPath)
++        if statErr != nil {
++                slog.Info("cpu: /proc/stat probe failed — gopsutil cannot provide CPU usage", "err", statErr)
++        } else {
++                slog.Info("cpu: /proc/stat probe", "bytes", len(data), "usable_counters", procStatHasUsableData(data))
++        }
++        times, timesErr := cpu.Times(false)
++        switch {
++        case timesErr != nil:
++                slog.Info("cpu: cpu.Times probe failed", "err", timesErr)
++        case len(times) == 0:
++                slog.Info("cpu: cpu.Times probe returned no samples")
++        case cpuTimesAllZero(times[0]):
++                slog.Info("cpu: cpu.Times probe returned all-zero counters (dead /proc/stat)")
++        default:
++                slog.Info("cpu: cpu.Times probe ok — gopsutil /proc/stat source available")
++        }
++        if androidNoProcStat() {
++                slog.Info("cpu: android fallback engaged (no usable /proc/stat counters)")
++        } else {
++                slog.Info("cpu: android fallback not engaged — using gopsutil /proc/stat")
++        }
++}
++
++// cpuSelfCheck verifies ~4 seconds after startup that the engaged CPU
++// fallback source is actually producing numbers, logging the observed busy
++// percentage. It only reads the raw sources (no shared baseline state), so
++// it cannot disturb the regular polling.
++func cpuSelfCheck() {
++        if (runtime.GOOS != "linux" && runtime.GOOS != "android") || !androidNoProcStat() {
++                return // normal host: nothing to check
++        }
++        before, pids, found := androidProcessTicks()
++        if !found || pids == 0 {
++                if dirs := androidCpuDirs(); len(dirs) > 0 {
++                        slog.Info("cpu: self-check", "source", "cpufreq residency", "cpu_dirs", len(dirs),
++                                "note", "process ticks unreadable; per-poll values will come from cpufreq ratios")
++                } else {
++                        slog.Warn("cpu: self-check: no CPU source readable — CPU will report 0%",
++                                "hint", "run with LOG_LEVEL=debug to see which paths fail")
++                }
++                return
++        }
++        start := time.Now()
++        time.Sleep(4 * time.Second)
++        elapsed := time.Since(start).Seconds()
++        after, _, _ := androidProcessTicks()
++        cores := float64(max(runtime.NumCPU(), 1))
++        busyPct := utils.TwoDecimals((after - before) / elapsed / cores * 100)
++        slog.Info("cpu: self-check",
++                "busy_percent", busyPct,
++                "source", "process ticks",
++                "readable_pids", pids,
++                "window_seconds", int(elapsed+0.5),
++                "note", "counts only processes visible to this UID (same view as toybox top); 0% just means nothing ran during the window")
+ }
+diff --git a/agent/cpu_fallback_test.go b/agent/cpu_fallback_test.go
+index 0cef673..a09fcc3 100644
+--- a/agent/cpu_fallback_test.go
++++ b/agent/cpu_fallback_test.go
+@@ -1,156 +1,251 @@
+ package agent
+ 
+ import (
+-	"os"
+-	"path/filepath"
+-	"testing"
+-	"time"
++        "os"
++        "path/filepath"
++        "sync"
++        "testing"
++        "time"
++
++        "github.com/shirou/gopsutil/v4/cpu"
+ )
+ 
+ // TestAndroidCpuFallback simulates an unrooted Android environment where
+ // /proc/stat is unreadable but process ticks and cpufreq time_in_state work.
+ func TestAndroidCpuFallback(t *testing.T) {
+-	tmp := t.TempDir()
+-
+-	// Fixture 1: two CPUs with time_in_state files (arbitrary units).
+-	sysRoot := filepath.Join(tmp, "sys")
+-	writeTis := func(lo0, hi0, lo1, hi1 int) {
+-		vals := [][2]int{{lo0, hi0}, {lo1, hi1}}
+-		for i, v := range vals {
+-			dir := filepath.Join(sysRoot, "cpu"+string(rune('0'+i)))
+-			if err := os.MkdirAll(filepath.Join(dir, "cpufreq", "stats"), 0o755); err != nil {
+-				t.Fatal(err)
+-			}
+-			content := "800000 " + itoa(v[0]) + "\n1800000 " + itoa(v[1]) + "\n"
+-			if err := os.WriteFile(filepath.Join(dir, "cpufreq", "stats", "time_in_state"), []byte(content), 0o644); err != nil {
+-				t.Fatal(err)
+-			}
+-		}
+-	}
+-	// Initial state (baseline is re-seeded later, values are arbitrary).
+-	writeTis(600, 400, 1200, 800)
+-
+-	// Fixture 2: a readable /proc/<pid>/stat with utime=300 stime=100.
+-	procRoot := filepath.Join(tmp, "proc")
+-	pidDir := filepath.Join(procRoot, "1234")
+-	if err := os.MkdirAll(pidDir, 0o755); err != nil {
+-		t.Fatal(err)
+-	}
+-	statLine := "1234 (bash) R 1 1 1 0 0 0 0 0 0 0 0 300 100 0 0 0 0 0 0 0\n"
+-	if err := os.WriteFile(filepath.Join(pidDir, "stat"), []byte(statLine), 0o644); err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	// /proc/stat unreadable.
+-	if err := os.WriteFile(filepath.Join(procRoot, "stat"), []byte(""), 0o000); err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	// Swap in fixture paths / fake clock.
+-	oldStatPath, oldSysRoot, oldProcRoot := androidProcStatPath, androidSysCpuRoot, androidProcPidRoot
+-	oldNow := androidClockNow
+-	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+-	tick := 0
+-	androidClockNow = func() time.Time {
+-		tick++
+-		return baseTime.Add(time.Duration(tick) * time.Minute)
+-	}
+-	resetState := func() {
+-		androidMu.Lock()
+-		androidTotal = androidCpuState{}
+-		androidPerCore = nil
+-		androidLastRaw = androidRawSamples{}
+-		androidCumBusy = nil
+-		androidMu.Unlock()
+-	}
+-	defer func() {
+-		androidProcStatPath, androidSysCpuRoot, androidProcPidRoot = oldStatPath, oldSysRoot, oldProcRoot
+-		androidClockNow = oldNow
+-		resetState()
+-	}()
+-	androidProcStatPath, androidSysCpuRoot, androidProcPidRoot = filepath.Join(procRoot, "stat"), sysRoot, procRoot
+-
+-	// ---- Phase 1: process ticks are the primary source ----
+-	// First call seeds the baseline (empty result).
+-	first, err := androidCpuTimes(false)
+-	if err != nil {
+-		t.Fatalf("unexpected error: %v", err)
+-	}
+-	if len(first) != 0 {
+-		t.Fatalf("expected empty baseline, got %d", len(first))
+-	}
+-
+-	// Advance process ticks? No — the fixture pid stat is static; utime+stime
+-	// stays 400 jiffies = 4s busy. One minute later (wall = 60s x 2 cores):
+-	second, err := androidCpuTimes(false)
+-	if err != nil {
+-		t.Fatalf("unexpected error: %v", err)
+-	}
+-	if len(second) != 1 {
+-		t.Fatalf("expected 1 aggregate, got %d", len(second))
+-	}
+-	cur := second[0]
+-	if cur.User <= 0 || cur.Idle <= 0 {
+-		t.Fatalf("expected positive busy/idle, got %+v", cur)
+-	}
+-	total := cur.User + cur.Idle
+-	pct := cur.User / total * 100
+-	// 4s busy of 120s wall = ~3.33%. The cpufreq fixture below (40% busy)
+-	// must NOT leak into this number, proving process ticks win.
+-	if pct < 2 || pct > 5 {
+-		t.Fatalf("expected ~3.3%% busy from process ticks, got %.2f%% (user=%.2fs idle=%.2fs)", pct, cur.User, cur.Idle)
+-	}
+-
+-	// Per-core: two cores. First call seeds the baseline.
+-	if _, err := androidCpuTimes(true); err != nil {
+-		t.Fatalf("unexpected error: %v", err)
+-	}
+-	perCore, err := androidCpuTimes(true)
+-	if err != nil {
+-		t.Fatalf("unexpected error: %v", err)
+-	}
+-	if len(perCore) != 2 {
+-		t.Fatalf("expected 2 cores, got %d", len(perCore))
+-	}
+-
+-	// ---- Phase 2: cpufreq residency-ratio fallback ----
+-	// Hide the /proc pid fixture (keep /proc/stat unreadable) so only
+-	// cpufreq remains. Advance counters: +1000 total per core, of which
+-	// +600 at the lowest frequency => 40% busy over the interval.
+-	procBackup := androidProcPidRoot
+-	androidProcPidRoot = filepath.Join(tmp, "missing-proc")
+-	tick = 0 // reset clock
+-	resetState()
+-	if _, err := androidCpuTimes(false); err != nil {
+-		t.Fatalf("cpufreq fallback failed: %v", err)
+-	}
+-	writeTis(1200, 800, 1800, 1200)
+-	fbTimes, err := androidCpuTimes(false)
+-	if err != nil {
+-		t.Fatalf("unexpected error: %v", err)
+-	}
+-	if len(fbTimes) != 1 {
+-		t.Fatalf("expected 1 aggregate, got %d", len(fbTimes))
+-	}
+-	fb := fbTimes[0]
+-	if fb.User <= 0 || fb.Idle <= 0 {
+-		t.Fatalf("expected positive busy/idle, got %+v", fb)
+-	}
+-	fbPct := fb.User / (fb.User + fb.Idle) * 100
+-	if fbPct < 35 || fbPct > 45 {
+-		t.Fatalf("expected ~40%% busy from cpufreq ratios, got %.1f%% (user=%.1fs idle=%.1fs)", fbPct, fb.User, fb.Idle)
+-	}
+-	androidProcPidRoot = procBackup
++        tmp := t.TempDir()
++
++        // Fixture 1: two CPUs with time_in_state files (arbitrary units).
++        sysRoot := filepath.Join(tmp, "sys")
++        writeTis := func(lo0, hi0, lo1, hi1 int) {
++                vals := [][2]int{{lo0, hi0}, {lo1, hi1}}
++                for i, v := range vals {
++                        dir := filepath.Join(sysRoot, "cpu"+string(rune('0'+i)))
++                        if err := os.MkdirAll(filepath.Join(dir, "cpufreq", "stats"), 0o755); err != nil {
++                                t.Fatal(err)
++                        }
++                        content := "800000 " + itoa(v[0]) + "\n1800000 " + itoa(v[1]) + "\n"
++                        if err := os.WriteFile(filepath.Join(dir, "cpufreq", "stats", "time_in_state"), []byte(content), 0o644); err != nil {
++                                t.Fatal(err)
++                        }
++                }
++        }
++        // Initial state (baseline is re-seeded later, values are arbitrary).
++        writeTis(600, 400, 1200, 800)
++
++        // Fixture 2: a readable /proc/<pid>/stat with utime=300 stime=100.
++        procRoot := filepath.Join(tmp, "proc")
++        pidDir := filepath.Join(procRoot, "1234")
++        if err := os.MkdirAll(pidDir, 0o755); err != nil {
++                t.Fatal(err)
++        }
++        statLine := "1234 (bash) R 1 1 1 0 0 0 0 0 0 0 0 300 100 0 0 0 0 0 0 0\n"
++        if err := os.WriteFile(filepath.Join(pidDir, "stat"), []byte(statLine), 0o644); err != nil {
++                t.Fatal(err)
++        }
++
++        // /proc/stat unreadable.
++        if err := os.WriteFile(filepath.Join(procRoot, "stat"), []byte(""), 0o000); err != nil {
++                t.Fatal(err)
++        }
++
++        // Swap in fixture paths / fake clock.
++        oldStatPath, oldSysRoot, oldProcRoot := androidProcStatPath, androidSysCpuRoot, androidProcPidRoot
++        oldNow := androidClockNow
++        baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
++        tick := 0
++        androidClockNow = func() time.Time {
++                tick++
++                return baseTime.Add(time.Duration(tick) * time.Minute)
++        }
++        resetState := func() {
++                androidMu.Lock()
++                androidTotal = androidCpuState{}
++                androidPerCore = nil
++                androidLastRaw = androidRawSamples{}
++                androidCumBusy = nil
++                androidMu.Unlock()
++        }
++        defer func() {
++                androidProcStatPath, androidSysCpuRoot, androidProcPidRoot = oldStatPath, oldSysRoot, oldProcRoot
++                androidClockNow = oldNow
++                resetState()
++        }()
++        androidProcStatPath, androidSysCpuRoot, androidProcPidRoot = filepath.Join(procRoot, "stat"), sysRoot, procRoot
++
++        // ---- Phase 1: process ticks are the primary source ----
++        // First call seeds the baseline (empty result).
++        first, err := androidCpuTimes(false)
++        if err != nil {
++                t.Fatalf("unexpected error: %v", err)
++        }
++        if len(first) != 0 {
++                t.Fatalf("expected empty baseline, got %d", len(first))
++        }
++
++        // Advance process ticks? No — the fixture pid stat is static; utime+stime
++        // stays 400 jiffies = 4s busy. One minute later (wall = 60s x 2 cores):
++        second, err := androidCpuTimes(false)
++        if err != nil {
++                t.Fatalf("unexpected error: %v", err)
++        }
++        if len(second) != 1 {
++                t.Fatalf("expected 1 aggregate, got %d", len(second))
++        }
++        cur := second[0]
++        if cur.User <= 0 || cur.Idle <= 0 {
++                t.Fatalf("expected positive busy/idle, got %+v", cur)
++        }
++        total := cur.User + cur.Idle
++        pct := cur.User / total * 100
++        // 4s busy of 120s wall = ~3.33%. The cpufreq fixture below (40% busy)
++        // must NOT leak into this number, proving process ticks win.
++        if pct < 2 || pct > 5 {
++                t.Fatalf("expected ~3.3%% busy from process ticks, got %.2f%% (user=%.2fs idle=%.2fs)", pct, cur.User, cur.Idle)
++        }
++
++        // Per-core: two cores. First call seeds the baseline.
++        if _, err := androidCpuTimes(true); err != nil {
++                t.Fatalf("unexpected error: %v", err)
++        }
++        perCore, err := androidCpuTimes(true)
++        if err != nil {
++                t.Fatalf("unexpected error: %v", err)
++        }
++        if len(perCore) != 2 {
++                t.Fatalf("expected 2 cores, got %d", len(perCore))
++        }
++
++        // ---- Phase 2: cpufreq residency-ratio fallback ----
++        // Hide the /proc pid fixture (keep /proc/stat unreadable) so only
++        // cpufreq remains. Advance counters: +1000 total per core, of which
++        // +600 at the lowest frequency => 40% busy over the interval.
++        procBackup := androidProcPidRoot
++        androidProcPidRoot = filepath.Join(tmp, "missing-proc")
++        tick = 0 // reset clock
++        resetState()
++        if _, err := androidCpuTimes(false); err != nil {
++                t.Fatalf("cpufreq fallback failed: %v", err)
++        }
++        writeTis(1200, 800, 1800, 1200)
++        fbTimes, err := androidCpuTimes(false)
++        if err != nil {
++                t.Fatalf("unexpected error: %v", err)
++        }
++        if len(fbTimes) != 1 {
++                t.Fatalf("expected 1 aggregate, got %d", len(fbTimes))
++        }
++        fb := fbTimes[0]
++        if fb.User <= 0 || fb.Idle <= 0 {
++                t.Fatalf("expected positive busy/idle, got %+v", fb)
++        }
++        fbPct := fb.User / (fb.User + fb.Idle) * 100
++        if fbPct < 35 || fbPct > 45 {
++                t.Fatalf("expected ~40%% busy from cpufreq ratios, got %.1f%% (user=%.1fs idle=%.1fs)", fbPct, fb.User, fb.Idle)
++        }
++        androidProcPidRoot = procBackup
+ }
+ 
+ func itoa(n int) string {
+-	if n == 0 {
+-		return "0"
+-	}
+-	digits := ""
+-	for n > 0 {
+-		digits = string(rune('0'+n%10)) + digits
+-		n /= 10
+-	}
+-	return digits
++        if n == 0 {
++                return "0"
++        }
++        digits := ""
++        for n > 0 {
++                digits = string(rune('0'+n%10)) + digits
++                n /= 10
++        }
++        return digits
++}
++
++// TestAndroidNoProcStatGate verifies the fallback gate: it must engage when
++// /proc/stat is unreadable AND when it is readable but dead (all-zero or
++// missing aggregate counters), which otherwise silently pins CPU at 0%.
++func TestAndroidNoProcStatGate(t *testing.T) {
++        tmp := t.TempDir()
++        oldPath, oldGate := androidProcStatPath, androidNoProcStat
++        defer func() { androidProcStatPath, androidNoProcStat = oldPath, oldGate }()
++        rebuild := func() { androidNoProcStat = sync.OnceValue(androidNoProcStatCheck) }
++
++        // 1. unreadable file → engaged
++        p := filepath.Join(tmp, "unreadable")
++        if err := os.WriteFile(p, []byte("cpu  10 0 20 900 0 0 0 0 0 0\n"), 0o000); err != nil {
++                t.Fatal(err)
++        }
++        androidProcStatPath = p
++        rebuild()
++        if !androidNoProcStat() {
++                t.Fatal("expected gate engaged for unreadable /proc/stat")
++        }
++
++        // 2. readable but all-zero counters → engaged (the silent-zero trap)
++        p = filepath.Join(tmp, "dead")
++        if err := os.WriteFile(p, []byte("cpu  0 0 0 0 0 0 0 0 0 0\n"), 0o644); err != nil {
++                t.Fatal(err)
++        }
++        androidProcStatPath = p
++        rebuild()
++        if !androidNoProcStat() {
++                t.Fatal("expected gate engaged for all-zero /proc/stat")
++        }
++
++        // 3. readable with no aggregate cpu line → engaged
++        p = filepath.Join(tmp, "partial")
++        if err := os.WriteFile(p, []byte("intr 12345\nctxt 999\n"), 0o644); err != nil {
++                t.Fatal(err)
++        }
++        androidProcStatPath = p
++        rebuild()
++        if !androidNoProcStat() {
++                t.Fatal("expected gate engaged for /proc/stat without aggregate cpu line")
++        }
++
++        // 4. readable with usable counters → not engaged
++        p = filepath.Join(tmp, "alive")
++        if err := os.WriteFile(p, []byte("cpu  10 0 20 900 0 0 0 0 0 0\n"), 0o644); err != nil {
++                t.Fatal(err)
++        }
++        androidProcStatPath = p
++        rebuild()
++        if androidNoProcStat() {
++                t.Fatal("expected gate disengaged for usable /proc/stat")
++        }
++}
++
++// TestCpuTimesAllZero covers the dead-counter helper.
++func TestCpuTimesAllZero(t *testing.T) {
++        if !cpuTimesAllZero(cpu.TimesStat{}) {
++                t.Fatal("expected zero TimesStat to be dead")
++        }
++        if cpuTimesAllZero(cpu.TimesStat{User: 0.001}) {
++                t.Fatal("expected nonzero TimesStat to be alive")
++        }
++        if cpuTimesAllZero(cpu.TimesStat{Idle: 100}) {
++                t.Fatal("expected idle-only TimesStat to be alive")
++        }
++}
++
++// TestSeedFallbackBaseline verifies that a missing or all-zero baseline is
++// replaced by the fallback sample (and an existing live baseline is kept).
++func TestSeedFallbackBaseline(t *testing.T) {
++        sample := cpu.TimesStat{User: 10, Idle: 90}
++        // missing baseline
++        lastCpuTimes[60000] = cpu.TimesStat{}
++        delete(lastCpuTimes, 60000)
++        seedFallbackBaseline(60000, sample)
++        if lastCpuTimes[60000].User != 10 {
++                t.Fatal("expected baseline seeded from fallback sample")
++        }
++        // dead baseline
++        lastCpuTimes[60000] = cpu.TimesStat{}
++        seedFallbackBaseline(60000, sample)
++        if lastCpuTimes[60000].User != 10 {
++                t.Fatal("expected dead baseline replaced")
++        }
++        // live baseline kept
++        lastCpuTimes[60000] = cpu.TimesStat{User: 50, Idle: 50}
++        seedFallbackBaseline(60000, sample)
++        if lastCpuTimes[60000].User != 50 {
++                t.Fatal("expected live baseline to be kept")
++        }
+ }
+diff --git a/agent/memory_linux.go b/agent/memory_linux.go
+index 1df672f..a024eda 100644
+--- a/agent/memory_linux.go
++++ b/agent/memory_linux.go
+@@ -1,82 +1,82 @@
+-//go:build linux
++//go:build linux || android
+ 
+ package agent
+ 
+ import (
+-	"path/filepath"
+-	"strconv"
++        "path/filepath"
++        "strconv"
+ 
+-	"github.com/henrygd/beszel/agent/utils"
++        "github.com/henrygd/beszel/agent/utils"
+ )
+ 
+ // containerMemoryMetrics is only used when USE_CGROUP is explicitly enabled.
+ // Unlike /proc/stat, lxcfs already serves a container-scoped /proc/meminfo,
+ // so LXC keeps the existing memory path by default.
+ func containerMemoryMetrics(hostTotal uint64, forceUseCgroup bool) (memoryMetrics, bool) {
+-	if !forceUseCgroup {
+-		return memoryMetrics{}, false
+-	}
+-	if dir, ok := cgroupV2Dir(); ok {
+-		if metrics, ok := readCgroupMemoryMetrics(dir, hostTotal, true); ok {
+-			return metrics, true
+-		}
+-	}
+-	if dir := utils.CgroupMountPoint(cgroupMountinfo, "cgroup", "memory"); dir != "" {
+-		return readCgroupMemoryMetrics(dir, hostTotal, false)
+-	}
+-	return memoryMetrics{}, false
++        if !forceUseCgroup {
++                return memoryMetrics{}, false
++        }
++        if dir, ok := cgroupV2Dir(); ok {
++                if metrics, ok := readCgroupMemoryMetrics(dir, hostTotal, true); ok {
++                        return metrics, true
++                }
++        }
++        if dir := utils.CgroupMountPoint(cgroupMountinfo, "cgroup", "memory"); dir != "" {
++                return readCgroupMemoryMetrics(dir, hostTotal, false)
++        }
++        return memoryMetrics{}, false
+ }
+ 
+ // Read the hierarchy mount root to include sibling services and descendants,
+ // rather than the agent's own service cgroup. A v1 unlimited limit is a
+ // page-aligned LONG_MAX sentinel; the threshold also covers 32-bit kernels.
+ func readCgroupMemoryMetrics(dir string, hostTotal uint64, v2 bool) (memoryMetrics, bool) {
+-	usageFile, limitFile, cacheKey, shmemKey := "memory.usage_in_bytes", "memory.limit_in_bytes", "total_cache", "total_shmem"
+-	if v2 {
+-		usageFile, limitFile, cacheKey, shmemKey = "memory.current", "memory.max", "file", "shmem"
+-	}
+-	usage, ok := utils.ReadUintFile(filepath.Join(dir, usageFile))
+-	if !ok {
+-		return memoryMetrics{}, false
+-	}
+-	rawLimit, ok := utils.ReadStringFileOK(filepath.Join(dir, limitFile))
+-	if !ok {
+-		return memoryMetrics{}, false
+-	}
+-	var limit uint64
+-	if !(v2 && rawLimit == "max") {
+-		var err error
+-		limit, err = strconv.ParseUint(rawLimit, 10, 64)
+-		if err != nil {
+-			return memoryMetrics{}, false
+-		}
+-		if !v2 && (limit >= (uint64(1)<<63)-(1<<20) || limit == 2147479552) {
+-			limit = 0 // v1 unlimited sentinel
+-		} else if limit == 0 {
+-			return memoryMetrics{}, false
+-		}
+-	}
+-	total := limit
+-	if hostTotal > 0 && (total == 0 || hostTotal < total) {
+-		total = hostTotal
+-	}
+-	if total == 0 {
+-		return memoryMetrics{}, false // unlimited and no usable host total
+-	}
+-	stat, err := utils.ReadCgroupStat(filepath.Join(dir, "memory.stat"))
+-	if err != nil {
+-		return memoryMetrics{}, false
+-	}
+-	cache, ok := stat[cacheKey]
+-	if !ok {
+-		return memoryMetrics{}, false
+-	}
+-	shmem, ok := stat[shmemKey]
+-	if !ok {
+-		return memoryMetrics{}, false
+-	}
+-	// Both cache (v1) and file (v2) include shmem/tmpfs, which must remain
+-	// charged as used memory rather than being classified as file cache.
+-	cache = min(saturatingSub(cache, shmem), usage)
+-	return memoryMetrics{Total: total, Used: usage - cache, BuffCache: cache}, true
++        usageFile, limitFile, cacheKey, shmemKey := "memory.usage_in_bytes", "memory.limit_in_bytes", "total_cache", "total_shmem"
++        if v2 {
++                usageFile, limitFile, cacheKey, shmemKey = "memory.current", "memory.max", "file", "shmem"
++        }
++        usage, ok := utils.ReadUintFile(filepath.Join(dir, usageFile))
++        if !ok {
++                return memoryMetrics{}, false
++        }
++        rawLimit, ok := utils.ReadStringFileOK(filepath.Join(dir, limitFile))
++        if !ok {
++                return memoryMetrics{}, false
++        }
++        var limit uint64
++        if !(v2 && rawLimit == "max") {
++                var err error
++                limit, err = strconv.ParseUint(rawLimit, 10, 64)
++                if err != nil {
++                        return memoryMetrics{}, false
++                }
++                if !v2 && (limit >= (uint64(1)<<63)-(1<<20) || limit == 2147479552) {
++                        limit = 0 // v1 unlimited sentinel
++                } else if limit == 0 {
++                        return memoryMetrics{}, false
++                }
++        }
++        total := limit
++        if hostTotal > 0 && (total == 0 || hostTotal < total) {
++                total = hostTotal
++        }
++        if total == 0 {
++                return memoryMetrics{}, false // unlimited and no usable host total
++        }
++        stat, err := utils.ReadCgroupStat(filepath.Join(dir, "memory.stat"))
++        if err != nil {
++                return memoryMetrics{}, false
++        }
++        cache, ok := stat[cacheKey]
++        if !ok {
++                return memoryMetrics{}, false
++        }
++        shmem, ok := stat[shmemKey]
++        if !ok {
++                return memoryMetrics{}, false
++        }
++        // Both cache (v1) and file (v2) include shmem/tmpfs, which must remain
++        // charged as used memory rather than being classified as file cache.
++        cache = min(saturatingSub(cache, shmem), usage)
++        return memoryMetrics{Total: total, Used: usage - cache, BuffCache: cache}, true
+ }
+diff --git a/agent/memory_unsupported.go b/agent/memory_unsupported.go
+index 21e320d..1e6a660 100644
+--- a/agent/memory_unsupported.go
++++ b/agent/memory_unsupported.go
+@@ -1,7 +1,7 @@
+-//go:build !linux
++//go:build !linux && !android
+ 
+ package agent
+ 
+ func containerMemoryMetrics(uint64, bool) (memoryMetrics, bool) {
+-	return memoryMetrics{}, false
++        return memoryMetrics{}, false
+ }
+diff --git a/agent/system.go b/agent/system.go
+index 74dc0f4..06db8bc 100644
+--- a/agent/system.go
++++ b/agent/system.go
+@@ -182,6 +182,9 @@ func (a *Agent) getSystemStats(cacheTimeMs uint16) system.Stats {
+ 	} else {
+ 		slog.Error("Error getting cpu metrics", "err", err)
+ 	}
++	// Surface a persistently dead CPU source: several consecutive zero
++	// polls at the default interval are worth a warning.
++	noteCpuPollOutcome(cacheTimeMs, err, systemStats.Cpu)
+ 
+ 	// per-core cpu usage. Skipped when the total comes from cgroup accounting:
+ 	// per-core /proc/stat counters there describe shared host cores, not the
+diff --git a/agent/uptime_linux.go b/agent/uptime_linux.go
+index a91ee81..c871a16 100644
+--- a/agent/uptime_linux.go
++++ b/agent/uptime_linux.go
+@@ -1,14 +1,14 @@
+-//go:build linux
++//go:build linux || android
+ 
+ package agent
+ 
+ import (
+-	"math"
+-	"os"
+-	"strconv"
+-	"strings"
++        "math"
++        "os"
++        "strconv"
++        "strings"
+ 
+-	"github.com/shirou/gopsutil/v4/host"
++        "github.com/shirou/gopsutil/v4/host"
+ )
+ 
+ // uptimeFilePath is a variable so tests can point it at a fixture.
+@@ -24,21 +24,21 @@ var uptimeFilePath = "/proc/uptime"
+ // Falls back to host.Uptime() if /proc/uptime is missing or unparseable, so
+ // behavior is unchanged anywhere the file isn't available.
+ func getUptime() (uint64, error) {
+-	data, err := os.ReadFile(uptimeFilePath)
+-	if err != nil {
+-		return host.Uptime()
+-	}
+-	fields := strings.Fields(string(data))
+-	if len(fields) == 0 {
+-		return host.Uptime()
+-	}
+-	seconds, err := strconv.ParseFloat(fields[0], 64)
+-	if err != nil ||
+-		math.IsNaN(seconds) ||
+-		math.IsInf(seconds, 0) ||
+-		seconds < 0 ||
+-		seconds >= 1<<64 {
+-		return host.Uptime()
+-	}
+-	return uint64(seconds), nil
++        data, err := os.ReadFile(uptimeFilePath)
++        if err != nil {
++                return host.Uptime()
++        }
++        fields := strings.Fields(string(data))
++        if len(fields) == 0 {
++                return host.Uptime()
++        }
++        seconds, err := strconv.ParseFloat(fields[0], 64)
++        if err != nil ||
++                math.IsNaN(seconds) ||
++                math.IsInf(seconds, 0) ||
++                seconds < 0 ||
++                seconds >= 1<<64 {
++                return host.Uptime()
++        }
++        return uint64(seconds), nil
+ }
+diff --git a/agent/uptime_stub.go b/agent/uptime_stub.go
+index 063de75..1c49df1 100644
+--- a/agent/uptime_stub.go
++++ b/agent/uptime_stub.go
+@@ -1,4 +1,4 @@
+-//go:build !linux
++//go:build !linux && !android
+ 
+ package agent
+ 
+@@ -6,5 +6,5 @@ import "github.com/shirou/gopsutil/v4/host"
+ 
+ // getUptime returns the system uptime in seconds.
+ func getUptime() (uint64, error) {
+-	return host.Uptime()
++        return host.Uptime()
+ }
+diff --git a/agent/utils/utils.go b/agent/utils/utils.go
+index 8147329..36c691a 100644
+--- a/agent/utils/utils.go
++++ b/agent/utils/utils.go
+@@ -133,6 +133,14 @@ func statExecutable(path string) error {
+ 	return nil
+ }
+ 
++// SafeLookPath is a seccomp-safe replacement for exec.LookPath with the
++// same semantics: Android seccomp filters (Android < 12) kill processes
++// that issue the faccessat2 syscall which Go >= 1.24 uses inside
++// exec.LookPath, while os.Stat (newfstatat) is safe on every version.
++func SafeLookPath(file string) (string, error) {
++	return safeLookPathHomebrewExec(file)
++}
++
+ // LookPathHomebrew is like exec.LookPath but also checks Homebrew paths.
+ func LookPathHomebrew(file string) (string, error) {
+ 	foundPath, lookPathErr := safeLookPathHomebrewExec(file)

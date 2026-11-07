@@ -133,6 +133,14 @@ func statExecutable(path string) error {
 	return nil
 }
 
+// SafeLookPath is a seccomp-safe replacement for exec.LookPath with the
+// same semantics: Android seccomp filters (Android < 12) kill processes
+// that issue the faccessat2 syscall which Go >= 1.24 uses inside
+// exec.LookPath, while os.Stat (newfstatat) is safe on every version.
+func SafeLookPath(file string) (string, error) {
+	return safeLookPathHomebrewExec(file)
+}
+
 // LookPathHomebrew is like exec.LookPath but also checks Homebrew paths.
 func LookPathHomebrew(file string) (string, error) {
 	foundPath, lookPathErr := safeLookPathHomebrewExec(file)

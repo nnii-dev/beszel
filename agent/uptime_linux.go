@@ -1,14 +1,14 @@
-//go:build linux
+//go:build linux || android
 
 package agent
 
 import (
-	"math"
-	"os"
-	"strconv"
-	"strings"
+        "math"
+        "os"
+        "strconv"
+        "strings"
 
-	"github.com/shirou/gopsutil/v4/host"
+        "github.com/shirou/gopsutil/v4/host"
 )
 
 // uptimeFilePath is a variable so tests can point it at a fixture.
@@ -24,21 +24,21 @@ var uptimeFilePath = "/proc/uptime"
 // Falls back to host.Uptime() if /proc/uptime is missing or unparseable, so
 // behavior is unchanged anywhere the file isn't available.
 func getUptime() (uint64, error) {
-	data, err := os.ReadFile(uptimeFilePath)
-	if err != nil {
-		return host.Uptime()
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) == 0 {
-		return host.Uptime()
-	}
-	seconds, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil ||
-		math.IsNaN(seconds) ||
-		math.IsInf(seconds, 0) ||
-		seconds < 0 ||
-		seconds >= 1<<64 {
-		return host.Uptime()
-	}
-	return uint64(seconds), nil
+        data, err := os.ReadFile(uptimeFilePath)
+        if err != nil {
+                return host.Uptime()
+        }
+        fields := strings.Fields(string(data))
+        if len(fields) == 0 {
+                return host.Uptime()
+        }
+        seconds, err := strconv.ParseFloat(fields[0], 64)
+        if err != nil ||
+                math.IsNaN(seconds) ||
+                math.IsInf(seconds, 0) ||
+                seconds < 0 ||
+                seconds >= 1<<64 {
+                return host.Uptime()
+        }
+        return uint64(seconds), nil
 }
